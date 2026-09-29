@@ -42,10 +42,10 @@
   "suspend_reload_idle": 0,
   "mode": "desktop",
   "icons": {
-    "mic": "audio-input-microphone",
-    "busy": "emblem-synchronizing",
-    "ok": "emblem-default",
-    "warn": "dialog-warning",
-    "error": "dialog-error"
+    "mic": "~/.local/share/voicetype/icons/mic.png",
+    "busy": "~/.local/share/voicetype/icons/busy.png",
+    "ok": "~/.local/share/voicetype/icons/ok.png",
+    "warn": "~/.local/share/voicetype/icons/warn.png",
+    "error": "~/.local/share/voicetype/icons/error.png"
   }
 }

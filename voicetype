@@ -206,7 +206,9 @@ def notify(title, body="", icon="mic", timeout=0, urgency="normal"):
         return
     icons = dict(DEFAULT_ICONS)
     icons.update(cfg.get("icons") or {})
-    icon = icons.get(icon, icon)
+    icon = str(icons.get(icon, icon))
+    if "/" in icon or icon.startswith("~"):      # 允许用文件路径（自带平面图标就是路径）
+        icon = os.path.expanduser(icon)
     try:
         cmd = ["notify-send",
                "-h", "string:x-canonical-private-synchronous:voicetype",
@@ -1334,6 +1336,20 @@ def cmd_check(cfg):
         except Exception:
             live = False
         print("  socket 可连  : %s" % ("✅ 守护进程在跑" if live else "⚠️ 没在跑（systemctl --user start voicetype）"))
+
+    print("── 通知图标 ──")
+    icons = dict(DEFAULT_ICONS); icons.update(cfg.get("icons") or {})
+    for key in ("mic", "busy", "ok", "warn", "error"):
+        val = str(icons.get(key, ""))
+        mark = "✅"
+        if "/" in val or val.startswith("~"):
+            path = os.path.expanduser(val)
+            mark = "✅ " + path if os.path.exists(path) else "⚠️ 文件不存在 " + path
+            if not os.path.exists(path):
+                pass
+        else:
+            mark = "✅ 图标名 %s（由系统图标主题解析）" % val
+        print("  %-6s: %s" % (key, mark))
 
     print("── 剪贴板 ──")
     print("  wl-copy 写入 : %s" % ("✅" if set_clipboard("voicetype-check") else "❌"))

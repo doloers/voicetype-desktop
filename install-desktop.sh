@@ -13,6 +13,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "→ 安装主程序到 ~/.local/bin/voicetype"
 install -Dm755 "$DIR/voicetype" ~/.local/bin/voicetype
 
+echo "→ 安装通知图标到 ~/.local/share/voicetype/icons"
+mkdir -p ~/.local/share/voicetype/icons
+install -m644 "$DIR"/icons/*.svg "$DIR"/icons/png/*.png ~/.local/share/voicetype/icons/
+
 echo "→ 安装 systemd 用户服务（voicetype-desktop.service）"
 mkdir -p ~/.config/systemd/user
 install -Dm644 "$DIR/systemd/voicetype-desktop.service" \

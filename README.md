@@ -132,11 +132,35 @@ journalctl --user -u voicetype-desktop -f      # 或 tail -f /tmp/voicetype.log
 | `terminal_apps` | `foot, alacritty, kitty, …` | 判定为终端的 app_id 列表 |
 | `opus_bitrate` | `24` | OPUS 码率（kbps），`0` = 直接传 WAV |
 | `notify` / `save_history` | `true` | 桌面通知 / 保存识别历史 |
-| `icons` | `mic: audio-input-microphone`、`busy: emblem-synchronizing`、`ok: emblem-default`、`warn: dialog-warning`、`error: dialog-error` | 通知图标：值是 Freedesktop 图标名，也可以是**绝对路径**（想用某个具体 png/svg 就填路径） |
+| `icons` | 指向自带的平面图标：`~/.local/share/voicetype/icons/{mic,busy,ok,warn,error}.png` | 通知图标：值是**文件路径**（支持 `~`），也可以是 Freedesktop 图标名（由系统图标主题解析） |
 | `mode` | `desktop` | 只影响 `--check` 的提示（桌面上不要求音量键设备存在） |
 | `injector_retries` | `10` | 启动时注入器初始化重试次数（每次间隔 3s，防开机时 `/dev/uinput` 未就绪） |
 
 改完配置**不用重启服务**（每次开录前会重读）。
+
+### 通知图标（自带平面图标）
+
+仓库 `icons/` 是一套平面化（单色线条）图标，`install-desktop.sh` 会装到 `~/.local/share/voicetype/icons/`，
+配置里默认就指向它们：
+
+| 状态 | 文件 | 颜色 |
+|---|---|---|
+| 录音中 / 麦克风 | `mic.png` | 浅灰 `#e6e6e6` |
+| 识别中 | `busy.png` | 浅灰 `#e6e6e6` |
+| 已上屏 | `ok.png` | 绿 `#7bd88f` |
+| 录音太短 / 没录到声音 | `warn.png` | 琥珀 `#ffcc66` |
+| 识别失败 | `error.png` | 红 `#ff6b6b` |
+
+想换颜色或换成纯灰阶：编辑 `icons/*.svg` 里 `fill` 的值（源文件里只有一两种颜色，很好改），
+然后重新生成并安装：
+
+```bash
+./icons/build.sh                                   # svg -> icons/png/*.png（默认 48px，SIZE=64 ./icons/build.sh 可调）
+install -m644 icons/png/*.png ~/.local/share/voicetype/icons/
+```
+
+> **为什么用 PNG 而不是直接让 dunst 读 SVG**：通知守护进程走 gdk-pixbuf，而 gdk-pixbuf 的 SVG loader
+> 不一定装了（本机 Arch 上 dunst 1.13 就没有），此时 SVG 图标会**静默不显示**。PNG 到处都能加载。
 
 ## 排障
 
@@ -148,7 +172,7 @@ journalctl --user -u voicetype-desktop -f      # 或 tail -f /tmp/voicetype.log
 | 识别成功但没上屏 | `voicetype --check` 看 `/dev/uinput` 是否可写（跑 `setup-uinput-desktop.sh`） |
 | 重启后按键没反应 | `systemctl --user status voicetype-desktop`；`ls -l /dev/uinput` 属主是否是你；`lsmod \| grep uinput` |
 | 提前自动收尾（还没说就停） | 环境噪声大：把 `silence_rms` 调高 或 `voice_chunks` 调大 |
-| 通知没图标 / 图标空白 | 图标名在你的图标主题里不存在。给 dunst 的 `icon_path` 加上实际目录（如 `/usr/share/icons/AdwaitaLegacy/48x48/legacy/`、`.../devices/`、`.../emblems/`），或直接在 `icons` 里写绝对路径 |
+| 通知没图标 / 图标空白 | ① 用图标**名**时主题里可能没有：给 dunst 的 `icon_path` 加上实际目录（如 `/usr/share/icons/AdwaitaLegacy/48x48/legacy/`），或在 `icons` 里直接写文件路径；② 给的是 **SVG** 路径时：dunst 用的 gdk-pixbuf 可能没有 SVG loader，换 PNG（`voicetype --check` 会检查文件是否存在） |
 | API 报 `45000010` / `45000030` | Key 无效 / 能力未开通（豆包控制台「开通管理」） |
 
 更多实测细节（为什么不用 wtype、`ID_INPUT_KEYBOARD` 标签、`uaccess` 规则顺序、`parec` 缓冲）
@@ -161,6 +185,7 @@ voicetype                       主程序（桌面模式 + 手机模式，单文
 install-desktop.sh              桌面安装（用户级）
 setup-uinput-desktop.sh         /dev/uinput 一次性 root 配置
 config.desktop.example.json     桌面配置模板
+icons/                          通知图标（平面化 SVG 源 + 生成的 PNG，见 icons/build.sh）
 systemd/voicetype-desktop.service
 NOTES.md                        实测笔记与踩坑记录
 phone-mode/                     上游手机模式（音量键）：install.sh / config / systemd / extras

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- VoiceType Desktop 通知图标（由 Adwaita symbolic 图标重着色，LGPL-3.0 / CC-BY-SA-3.0）
+     换颜色：改下面所有 fill 的值即可，例如把 #ff6b6b 换成 #e6e6e6（纯灰阶）或别的颜色 -->
+<svg height="16px" viewBox="0 0 16 16" width="16px" xmlns="http://www.w3.org/2000/svg">
+    <path d="m 8 1 c -3.871094 0 -7 3.128906 -7 7 s 3.128906 7 7 7 s 7 -3.128906 7 -7 s -3.128906 -7 -7 -7 z m -4 6 h 8 v 2 h -8 z m 0 0" fill="#ff6b6b"/>
+</svg>

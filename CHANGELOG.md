@@ -33,6 +33,12 @@
 
 ### 🔔 通知图标
 
+- 自带一套**平面化**图标（`icons/`，SVG 源 + 48px PNG 成品），安装到 `~/.local/share/voicetype/icons/`，
+  配置里默认指向它们；改颜色只需编辑 SVG 里的 `fill` 再 `./icons/build.sh`
+- 图标值支持文件路径（含 `~` 展开）；`voicetype --check` 会逐个检查图标文件是否存在
+- 实测坑：dunst 走的 gdk-pixbuf **可能没有 SVG loader**（本机 Arch 就是），SVG 图标会静默不显示
+  —— 所以成品用 PNG
+
 - 图标名可配置：`config.json` 的 `icons`（`mic` / `busy` / `ok` / `warn` / `error`），
   取值是 Freedesktop 图标名或绝对路径；默认 `audio-input-microphone`、`emblem-synchronizing`、
   `emblem-default`、`dialog-warning`、`dialog-error`
