@@ -15,6 +15,7 @@
   "silence_rms": 300,
   "max_seconds": 120,
   "min_seconds": 0.4,
+  "latency_ms": 20,
 
   "rate": 16000,
   "channels": 1,

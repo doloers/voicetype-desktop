@@ -33,6 +33,7 @@
 | `/dev/uinput` 虚拟键盘 | **`wtype`**（zwp_virtual_keyboard） | 无需 root、无需 udev 规则；niri 已实现该协议 |
 | `wt-focus` 查焦点 | **`niri msg --json focused-window`** | 本机就带，少装一个工具 |
 | 录音写文件后再读 | **流式录音 + RMS 静音检测** | 支持「说完静音 1.2s 自动收尾」，第二次按键都可省 |
+| `parec` 默认缓冲 | **加 `--latency-msec=20`** | 实测：不加时 parec 攒 ~2s 才吐数据，**开头 2 秒直接丢** |
 | 全 0 就重启 PulseAudio | 默认关闭（`heal_mic:false`），只弹提示 | PipeWire 上没有手机上那个挂起失效的毛病 |
 | 服务 `voicetype.service` | `voicetype-desktop.service`（`--serve`） | 两者的 `ExecStart` 不同，互不干扰 |
 
@@ -49,6 +50,7 @@ Mod+V { spawn-sh "voicetype --toggle"; }
 voicetype --serve        # 前台跑守护进程（正常走 systemd）
 voicetype --toggle       # 等同按快捷键
 voicetype --check        # 自检（依赖/设备/剪贴板/焦点/API 全查一遍）
+voicetype --levels 5     # 录 5 秒只打电平统计，用来校准 silence_rms
 
 systemctl --user status voicetype-desktop
 tail -f /tmp/voicetype.log          # 详细日志
@@ -73,6 +75,10 @@ tail -f /tmp/voicetype.log          # 详细日志
 
 ## 五、已知限制 / 坑
 
+- **`parec` 不加 `--latency-msec` 会吃掉开头约 2 秒音频**（实测：4s 请求只回 2s，
+  首包 2.02s 才到；加 `--latency-msec=20` 后首包 0.08s、丢 0.02s）。
+  手机上是长按 400ms 才开始说，所以丢的那 2 秒正好是按键的空档，一直没人发现；
+  桌面是「按下就说话」，不修就是丢句首。已在 `recorder_cmd()` 里默认加上（`latency_ms`）。
 - **niri 不支持按键释放绑定**（`niri validate` 实测：一个键位只能一个 action，没有 release 语法），
   所以做不了「按住说话」。真想要 push-to-talk 只有两条路：
   ① 用 evdev 抓键（要 `input` 组 / udev 规则，能读到按键的按下与松开）；

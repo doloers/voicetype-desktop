@@ -38,6 +38,7 @@ VoiceType — 长按音量键说话，松手自动上屏
   voicetype --status       查询状态
   voicetype --enter        注入一次回车
   voicetype --record N     手动录 N 秒并粘贴（调试）
+  voicetype --levels N     录 N 秒只打电平统计（校准 silence_rms）
   voicetype --devices      列出输入设备
   voicetype --check        自检
 """
@@ -95,6 +96,7 @@ DEFAULT_CONFIG = {
     "channels": 1,
     "source": "",           # 空 = 系统默认输入源
     "min_seconds": 0.4,
+    "latency_ms": 20,       # parec 缓冲延迟；0=用 parec 默认（会吃掉开头 ~2s！）
     # ── 注入 ──
     "paste_mods": ["LEFTCTRL"],                            # 普通应用：Ctrl+V
     "paste_mods_terminal": ["LEFTCTRL", "LEFTSHIFT"],      # 终端：Ctrl+Shift+V
@@ -116,6 +118,7 @@ DEFAULT_CONFIG = {
     "auto_stop": True,          # 桌面：说过话之后静音超过 silence_ms 自动停止
     "silence_ms": 1200,
     "silence_rms": 300,         # 16bit PCM 的 RMS 阈值（>= 视为有声音）
+    "voice_chunks": 3,          # 连续多少个 100ms 超阈值才算「真的在说话」（防噪声误触）
     "wtype_delay_ms": 30,       # wtype 注入时按住修饰键的时长（有些应用需要）
     "heal_mic": False,          # 采集失效时重启 PulseAudio（手机需要，桌面默认关）
 }
@@ -202,6 +205,11 @@ def recorder_cmd(cfg):
     cmd = ["parec", "--format=s16le",
            "--rate=%d" % cfg["rate"],
            "--channels=%d" % cfg["channels"], "--raw"]
+    # ⚠️ 实测（Arch + PipeWire）：parec 不用 --latency-msec 时默认攒够 ~2 秒才吐数据，
+    # 那 2 秒音频直接丢（按下就说话的桌面用法会吃掉整句话首）。加上小延迟即正常。
+    lat = cfg.get("latency_ms", 50)
+    if lat and int(lat) > 0:
+        cmd.append("--latency-msec=%d" % int(lat))
     if cfg.get("source"):
         cmd.append("--device=%s" % cfg["source"])
     return cmd
@@ -235,6 +243,7 @@ class Recorder:
         self.thread = None
         self.done = threading.Event()
         self.voiced = False
+        self.voice_run = 0        # 连续超阈值的块数（偶发噪声/按键声不足以“武装”自动收尾）
         self.started = time.time()
         self.last_voice = self.started
         self.chunk = max(1, int(cfg["rate"] * 2 * cfg["channels"] * 0.1))  # 100ms
@@ -251,6 +260,7 @@ class Recorder:
 
     def _loop(self):
         threshold = float(self.cfg.get("silence_rms", 300) or 0)
+        need = max(1, int(self.cfg.get("voice_chunks", 3) or 1))
         while True:
             d = self.p.stdout.read(self.chunk)
             if not d:
@@ -263,8 +273,12 @@ class Recorder:
             except Exception:
                 pass
             if threshold > 0 and pcm_rms(d) >= threshold:
-                self.voiced = True
                 self.last_voice = time.time()
+                self.voice_run += 1
+                if self.voice_run >= need:
+                    self.voiced = True
+            else:
+                self.voice_run = 0
         self.done.set()
 
     def seconds(self):
@@ -568,13 +582,17 @@ class WtypeInjector(Injector):
             return False
 
     def paste(self, mods):
-        delay = float(self.cfg.get("wtype_delay_ms", 30) or 0) / 1000.0
+        # wtype 的参数：-M/-m 按下/松开修饰键，-s 插一段睡眠(ms)，-k 按一下某个 keysym
+        #   （注意 -s 收的是整数毫秒，atoi 解析，写 0.03 会被当 0 而报错）
+        hold = int(float(self.cfg.get("wtype_delay_ms", 30) or 0))
         args = []
         for m in mods:
             args += ["-M", _WTYPE_MODS.get(m.upper(), "ctrl")]
-            if delay > 0:
-                args += ["-s", "%g" % delay]
+        if hold > 0:
+            args += ["-s", str(hold)]
         args += ["-k", self.cfg["paste_key"].lower()]
+        if hold > 0:
+            args += ["-s", str(hold)]
         for m in reversed(mods):
             args += ["-m", _WTYPE_MODS.get(m.upper(), "ctrl")]
         return self._run(args)
@@ -1148,6 +1166,32 @@ def cmd_devices():
     return 0
 
 
+def cmd_levels(cfg, secs):
+    """录 N 秒只打印电平统计 —— 用来校准 silence_rms（安静跑一次、说话再跑一次）"""
+    log("测电平 %.1f 秒…（先安静跑一次，再对着麦克风说话跑一次）" % secs)
+    rec = Recorder(cfg).start()
+    levels = []
+    t0 = time.time()
+    while time.time() - t0 < secs:
+        time.sleep(0.1)
+        with rec.lock:
+            tail = bytes(rec.buf[-rec.chunk:])
+        if tail:
+            levels.append(pcm_rms(tail))
+    rec.stop()
+    if not levels:
+        print("没采到数据（检查 parec/默认输入源）")
+        return 1
+    levels.sort()
+    print("  窗口数 %d（每个 100ms）" % len(levels))
+    print("  中位 RMS %d   90%% %d   最大 %d" % (
+        levels[len(levels) // 2], levels[int(len(levels) * 0.9)], levels[-1]))
+    print("  当前 silence_rms = %s（静音自动收尾的判定阈值）" % cfg.get("silence_rms"))
+    print("  校准：安静时中位 RMS 要明显低于阈值（否则自动收尾失效）；")
+    print("        说话时 90% 分位要明显高于阈值（否则刚开口就被当成静音）。")
+    return 0
+
+
 def cmd_record(cfg, secs):
     log("手动录音 %.1f 秒…" % secs)
     inj = make_injector(cfg)
@@ -1259,6 +1303,7 @@ USAGE = """VoiceType — 长按音量键说话，松手自动上屏
   voicetype --status       打印当前状态
   voicetype --enter        注入一次回车
   voicetype --record N     手动录 N 秒并粘贴（调试）
+  voicetype --levels N     录 N 秒只打电平统计（校准 silence_rms）
   voicetype --devices      列出输入设备
   voicetype --check        自检
   voicetype --config       打印当前配置
@@ -1291,6 +1336,8 @@ def main():
         return ctl(cfg, a[2:])
     if a == "--record":
         return cmd_record(cfg, float(args[1]) if len(args) > 1 else 5.0)
+    if a == "--levels":
+        return cmd_levels(cfg, float(args[1]) if len(args) > 1 else 5.0)
     print("未知参数: %s\n" % a)
     print(USAGE)
     return 2
