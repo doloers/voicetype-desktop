@@ -996,6 +996,7 @@ class Server:
     def start_rec(self):
         if self.rec is not None:
             return False, "已经在录音了"
+        self.cfg = load_config()      # 每次开录前重读配置 —— 改完 config.json 不用重启服务
         if not self.cfg.get("api_key"):
             log("❌ 未配置 api_key，不能录音")
             notify("VoiceType 未配置", "请先在 ~/.config/voicetype/config.json 填 api_key",
