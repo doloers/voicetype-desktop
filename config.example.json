@@ -1,0 +1,23 @@
+{
+  "api_key": "",
+  "resource_id": "volc.seedasr.auc",
+  "endpoint": "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",
+  "uid": "oneplus6",
+  "trigger_device": "Volume keys",
+  "hold_ms": 400,
+  "max_seconds": 120,
+  "rate": 16000,
+  "channels": 1,
+  "source": "",
+  "min_seconds": 0.4,
+  "paste_mods": [
+    "LEFTCTRL"
+  ],
+  "paste_key": "V",
+  "notify": true,
+  "save_history": true,
+  "suspend_reload_idle": 900,
+  "opus_bitrate": 24,
+  "grab": false,
+  "trigger_key": "KEY_VOLUMEDOWN"
+}

@@ -1,0 +1,12 @@
+# 含密钥，绝不提交
+config.json
+*.key
+
+# 运行时产物
+__pycache__/
+*.pyc
+*.raw
+*.opus
+*.wav
+*.log
+history.log

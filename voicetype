@@ -1,0 +1,852 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+VoiceType — 长按音量键说话，松手自动上屏
+=========================================
+平台 : postmarketOS / Phosh (Wayland) — OnePlus 6 (sdm845)
+识别 : 豆包语音「录音文件识别」大模型  volc.seedasr.auc  (0.8 元/小时)
+注入 : /dev/uinput 虚拟键盘 + wl-copy 剪贴板
+       —— 不用 wtype：剪贴板走 UTF-8，中文/emoji 天然安全
+
+设计 : 默认【不 grab】音量键，只是被动读取。
+       evdev 允许多个读者，所以不影响你已有的
+       volume-double-press.py（vol 上×2→pi / 下×2→claude 等）。
+       音量键本身仍由系统处理，正常调节音量。
+
+交互 :
+  长按音量下键 (>=hold_ms)   开始录音，弹通知
+  松开                       停止 -> 识别 -> 自动粘贴到当前焦点应用
+  短按                       忽略（音量正常调节）
+  长按音量上键 (>=enter_hold_ms)  注入一次回车 (Enter)
+  短按音量上键               忽略（音量正常调节）
+
+用法 :
+  voicetype                启动守护进程
+  voicetype --record N     手动录 N 秒并粘贴（调试）
+  voicetype --devices      列出输入设备
+  voicetype --check        自检
+"""
+
+import os
+import sys
+import io
+import json
+import time
+import glob
+import shutil
+import base64
+import wave
+import uuid
+import signal
+import select
+import traceback
+import subprocess
+import urllib.request
+import urllib.error
+from pathlib import Path
+from datetime import datetime
+
+# ─────────────────────────── 路径 ───────────────────────────
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "voicetype"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+DATA_DIR = HOME / ".local" / "share" / "voicetype"
+HISTORY = DATA_DIR / "history.log"
+RAW_PATH = "/dev/shm/voicetype_rec.raw"   # tmpfs
+LOGFILE = "/tmp/voicetype.log"
+
+DEFAULT_CONFIG = {
+    # ── 豆包语音 ──
+    "api_key": "",
+    "resource_id": "volc.seedasr.auc",
+    "endpoint": "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",
+    "uid": "oneplus6",
+    # ── 触发 ──
+    "trigger_device": "Volume keys",
+    "trigger_key": "KEY_VOLUMEDOWN",
+    "grab": False,          # False=被动读取，不影响其它读取者（推荐）
+    "hold_ms": 400,
+    "max_seconds": 60,
+    # ── 长按音量上 = 回车 ──
+    "enter_enabled": True,
+    "enter_key": "KEY_VOLUMEUP",
+    "enter_hold_ms": 400,
+    # ── 录音 ──
+    "rate": 16000,
+    "channels": 1,
+    "source": "",           # 空 = 系统默认输入源
+    "min_seconds": 0.4,
+    # ── 注入 ──
+    "paste_mods": ["LEFTCTRL"],                            # 普通应用：Ctrl+V
+    "paste_mods_terminal": ["LEFTCTRL", "LEFTSHIFT"],      # 终端：Ctrl+Shift+V
+    "paste_key": "V",
+    "focus_helper": "wt-focus",                            # 查焦点窗口的小工具
+    "terminal_apps": ["foot", "footclient", "kgx", "gnome-terminal",
+                      "ptyxis", "alacritty", "kitty", "wezterm",
+                      "xterm", "weston-terminal", "konsole"],
+    # ── 其它 ──
+    "notify": True,
+    "save_history": True,
+    # 麦克风自愈后，空闲多少秒把 suspend-on-idle 装回去（恢复省电）；0=不装回
+    "suspend_reload_idle": 900,
+    # 上传前用 OGG OPUS 压缩的码率(kbps)，体积约为 WAV 的 1/8；<=0 则直接传 WAV
+    "opus_bitrate": 24,
+}
+
+
+# ─────────────────────────── 日志 ───────────────────────────
+def log(msg):
+    line = "%s  %s" % (datetime.now().strftime("%H:%M:%S"), msg)
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    try:
+        with open(LOGFILE, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+# ─────────────────────── 会话环境发现 ───────────────────────
+_SESSION_KEYS = ("WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
+                 "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE")
+
+def session_env():
+    """缺会话变量时，从同 uid 的图形会话进程里捞。让守护进程既能被
+    systemd/autostart 启动，也能从 SSH 里手动跑。"""
+    env = dict(os.environ)
+    if env.get("WAYLAND_DISPLAY") and env.get("DBUS_SESSION_BUS_ADDRESS"):
+        return env
+    uid = os.getuid()
+    for pdir in sorted(glob.glob("/proc/[0-9]*")):
+        try:
+            if os.stat(pdir).st_uid != uid:
+                continue
+            with open(pdir + "/environ", "rb") as f:
+                items = f.read().split(b"\0")
+        except Exception:
+            continue
+        found = {}
+        for kv in items:
+            if b"=" not in kv:
+                continue
+            k, v = kv.split(b"=", 1)
+            k = k.decode(errors="replace")
+            if k in _SESSION_KEYS:
+                found[k] = v.decode(errors="replace")
+        if found.get("WAYLAND_DISPLAY") and found.get("DBUS_SESSION_BUS_ADDRESS"):
+            env.update(found)
+            return env
+    return env
+
+ENV = None
+
+
+# ───────────────────────── 配置 ─────────────────────────
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_FILE.exists():
+        try:
+            cfg.update(json.loads(CONFIG_FILE.read_text()))
+        except Exception as ex:
+            log("⚠️ 配置读取失败，用默认值: %s" % ex)
+    return cfg
+
+
+# ───────────────────────── 通知 ─────────────────────────
+def notify(title, body="", icon="microphone", timeout=0, urgency="normal"):
+    if not load_config().get("notify", True):
+        return
+    try:
+        cmd = ["notify-send",
+               "-h", "string:x-canonical-private-synchronous:voicetype",
+               "-i", icon, "-u", urgency, "-t", str(timeout), title]
+        if body:
+            cmd.append(body)
+        subprocess.Popen(cmd, env=ENV or session_env(),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as ex:
+        log("通知失败: %s" % ex)
+
+
+# ───────────────────────── 录音 ─────────────────────────
+def recorder_cmd(cfg):
+    cmd = ["parec", "--format=s16le",
+           "--rate=%d" % cfg["rate"],
+           "--channels=%d" % cfg["channels"], "--raw"]
+    if cfg.get("source"):
+        cmd.append("--device=%s" % cfg["source"])
+    return cmd
+
+
+def rec_start(cfg):
+    f = open(RAW_PATH, "wb")
+    p = subprocess.Popen(recorder_cmd(cfg), stdout=f,
+                         stderr=subprocess.DEVNULL, env=ENV or session_env())
+    return p, f
+
+
+def rec_stop(p, f):
+    """SIGINT 让 parec 把缓冲区刷干净"""
+    try:
+        p.send_signal(signal.SIGINT)
+        p.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        p.kill(); p.wait()
+    except Exception:
+        pass
+    try:
+        f.close()
+    except Exception:
+        pass
+    try:
+        with open(RAW_PATH, "rb") as fp:
+            return fp.read()
+    except Exception:
+        return b""
+
+
+def pcm_to_wav(raw, cfg):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(cfg["channels"])
+        w.setsampwidth(2)
+        w.setframerate(cfg["rate"])
+        w.writeframes(raw)
+    return buf.getvalue()
+
+
+def pcm_to_opus(raw, cfg):
+    """把裸 PCM 转成 OGG OPUS（体积约为 WAV 的 1/8），失败则回退 WAV。
+       opus_bitrate<=0 或没装 opusenc 时直接返回 WAV。"""
+    br = float(cfg.get("opus_bitrate", 24) or 0)
+    if br > 0:
+        try:
+            r = subprocess.run(
+                ["opusenc", "--quiet", "--raw",
+                 "--raw-rate", str(cfg["rate"]),
+                 "--raw-chan", str(cfg["channels"]),
+                 "--raw-bits", "16",
+                 "--bitrate", "%g" % br, "-", "-"],
+                input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=ENV or session_env(), timeout=60)
+            if r.returncode == 0 and r.stdout:
+                return r.stdout
+            log("opusenc 失败(rc=%s)，回退 WAV: %s"
+                % (r.returncode, r.stderr.decode(errors="replace")[:120]))
+        except FileNotFoundError:
+            pass   # 没装 opusenc，静默回退 WAV
+        except Exception as ex:
+            log("opusenc 异常，回退 WAV: %s" % ex)
+    return pcm_to_wav(raw, cfg)
+
+
+# ───────────────────────── 识别 ─────────────────────────
+ERRORS = {
+    "20000000": "成功",
+    "20000001": "识别中",
+    "20000002": "识别中",
+    "20000003": "音频是静音，没有检测到说话",
+    "45000000": "请求头缺少 X-Api-Key",
+    "45000010": "API Key 无效",
+    "45000030": "该能力未开通（去豆包语音控制台『开通管理』开通）",
+}
+
+
+def transcribe(wav_bytes, cfg, retries=5):
+    """返回 (ok, text_or_errmsg)"""
+    b64 = base64.b64encode(wav_bytes).decode()
+    body = json.dumps({
+        "user": {"uid": cfg.get("uid") or "voicetype"},
+        "audio": {"data": b64},
+        "request": {"model_name": "bigmodel"},
+    }).encode()
+
+    last = "未知错误"
+    for attempt in range(retries):
+        req = urllib.request.Request(
+            cfg["endpoint"], data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Api-Key": cfg["api_key"],
+                "X-Api-Resource-Id": cfg["resource_id"],
+                "X-Api-Request-Id": str(uuid.uuid4()),
+                "X-Api-Sequence": "-1",
+            })
+        try:
+            r = urllib.request.urlopen(req, timeout=90)
+            code = r.headers.get("X-Api-Status-Code", "")
+            raw = r.read().decode(errors="replace")
+        except urllib.error.HTTPError as ex:
+            code = ex.headers.get("X-Api-Status-Code", "") if ex.headers else ""
+            raw = ex.read().decode(errors="replace")
+            logid = ex.headers.get("X-Tt-Logid", "") if ex.headers else ""
+            last = "%s %s (logid %s)" % (code, ERRORS.get(code, raw[:120]), logid)
+            if code in ("45000010", "45000000", "45000030"):
+                return False, last
+        except Exception as ex:
+            # 网络/域名解析临时故障（如 DNS EAI_AGAIN）→ 递增退避重试
+            last = "网络异常: %s" % ex
+            if attempt < retries - 1:
+                wait = min(1.5 * (attempt + 1), 4)
+                log("网络重试 %d/%d（%s），%.1fs 后再试" % (attempt + 1, retries, ex, wait))
+                time.sleep(wait)
+            continue
+
+        if code == "20000000":
+            try:
+                text = (json.loads(raw).get("result") or {}).get("text", "") or ""
+            except Exception:
+                text = ""
+            if not text.strip():
+                return False, "识别结果为空"
+            return True, text.strip()
+
+        if code == "20000003":
+            return False, "没听到说话（录音太短或全是静音）"
+
+        last = "%s %s" % (code, ERRORS.get(code, raw[:120]))
+        if attempt < retries - 1:
+            time.sleep(0.8)
+
+    return False, last
+
+
+# ─────────────────── 剪贴板 + uinput 注入 ───────────────────
+CLIP_TMP = "/dev/shm/voicetype_clip.txt"
+CLIP_ERR = "/dev/shm/voicetype_clip.err"
+
+
+def set_clipboard(text):
+    """写入 Wayland 剪贴板。
+
+    ⚠️ 关键：wl-copy 会 fork 一个【常驻】子进程来持有剪贴板，该子进程会继承
+    父进程的 stdout/stderr。若用 subprocess 的 PIPE，父进程退出后管道仍不关闭，
+    subprocess.communicate() 会一直等 EOF —— 表现为「卡住直到超时」。
+    所以这里 stdio 全部重定向到文件 / DEVNULL，不给它任何管道。
+    """
+    try:
+        with open(CLIP_TMP, "w", encoding="utf-8") as f:
+            f.write(text)
+        with open(CLIP_TMP, "rb") as fin, open(CLIP_ERR, "wb") as ferr:
+            p = subprocess.run(
+                ["wl-copy", "--type", "text/plain;charset=utf-8"],
+                stdin=fin, stdout=subprocess.DEVNULL, stderr=ferr,
+                env=ENV or session_env(), timeout=5)
+        if p.returncode != 0:
+            try:
+                msg = open(CLIP_ERR, "rb").read().decode(errors="replace")[:200]
+            except Exception:
+                msg = ""
+            log("wl-copy rc=%s err=%s" % (p.returncode, msg))
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        log("wl-copy 超时")
+        return False
+    except Exception as ex:
+        log("wl-copy 异常: %s" % ex)
+        return False
+
+
+def clipboard_read():
+    """读回剪贴板，用于校验（wl-paste 不会 fork 常驻进程，可安全用 PIPE）"""
+    try:
+        with open(CLIP_ERR, "wb") as ferr:
+            p = subprocess.run(["wl-paste", "--no-newline"],
+                               stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=ferr,
+                               env=ENV or session_env(), timeout=5)
+        return p.stdout.decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def make_uinput(e, cfg):
+    keys = set()
+    for group in ("paste_mods", "paste_mods_terminal"):
+        for m in (cfg.get(group) or []):
+            keys.add(getattr(e, "KEY_" + m))
+    keys.add(getattr(e, "KEY_" + cfg["paste_key"]))
+    keys.add(e.KEY_VOLUMEUP)
+    keys.add(e.KEY_VOLUMEDOWN)
+    keys.add(e.KEY_ENTER)
+    from evdev import UInput
+    ui = UInput({e.EV_KEY: sorted(keys)},
+                name="voicetype-vkbd", bustype=e.BUS_USB)
+    time.sleep(0.35)          # 等合成器识别到新设备
+    return ui
+
+
+def inject_paste(ui, e, cfg, mods=None):
+    if mods is None:
+        mods = cfg["paste_mods"]
+    mods = [getattr(e, "KEY_" + m) for m in mods]
+    key = getattr(e, "KEY_" + cfg["paste_key"])
+    for m in mods:
+        ui.write(e.EV_KEY, m, 1)
+    ui.syn()
+    ui.write(e.EV_KEY, key, 1)
+    ui.syn()
+    time.sleep(0.02)
+    ui.write(e.EV_KEY, key, 0)
+    ui.syn()
+    for m in reversed(mods):
+        ui.write(e.EV_KEY, m, 0)
+    ui.syn()
+
+
+def inject_enter(ui, e):
+    """注入一次回车键 (tap Enter)"""
+    ui.write(e.EV_KEY, e.KEY_ENTER, 1)
+    ui.syn()
+    time.sleep(0.02)
+    ui.write(e.EV_KEY, e.KEY_ENTER, 0)
+    ui.syn()
+
+
+# ─────────────────── 焦点应用检测 ───────────────────
+def focused_app(cfg):
+    """用 wt-focus 查当前获得键盘焦点的顶层窗口 app_id。
+    失败返回 None（上层会退回默认粘贴组合键）。"""
+    helper = cfg.get("focus_helper") or "wt-focus"
+    path = shutil.which(helper) or os.path.expanduser("~/.local/bin/" + helper)
+    if not os.path.exists(path):
+        return None
+    try:
+        p = subprocess.run([path], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           env=ENV or session_env(), timeout=3)
+        if p.returncode == 0:
+            return p.stdout.decode(errors="replace").strip() or None
+    except Exception as ex:
+        log("wt-focus 失败: %s" % ex)
+    return None
+
+
+# ─────────────────────── 麦克风自愈 ───────────────────────
+# 自愈后是否处于「suspend-on-idle 已被卸载」的状态，以及最近一次录音时间。
+# 用于空闲一段时间后自动把 suspend-on-idle 装回去，恢复省电。
+_healed = False
+_last_activity = 0.0
+
+
+def reload_suspend(cfg):
+    """空闲后把 suspend-on-idle 装回去，恢复省电。"""
+    global _healed
+    if not _healed:
+        return
+    env = ENV or session_env()
+    try:
+        subprocess.run(["pactl", "load-module", "module-suspend-on-idle"],
+                       env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=5)
+        log("空闲 %ds 无录音，已重新启用 suspend-on-idle（恢复省电）"
+            % cfg.get("suspend_reload_idle", 900))
+    except Exception as ex:
+        log("重新启用 suspend-on-idle 失败: %s" % ex)
+    _healed = False
+
+
+def heal_mic(cfg):
+    """麦克风采集失效（suspend→resume 坏）时的自愈：
+       重启 PulseAudio 重新初始化采集路径，再卸载 module-suspend-on-idle。
+       （顺序很重要：必须在重启「之后」卸载，否则新实例会从
+       /etc/pulse/default.pa 把它又装回来。）"""
+    global _healed, _last_activity
+    env = ENV or session_env()
+    log("自愈：重启 PulseAudio 并卸载 suspend-on-idle")
+    try:
+        subprocess.run(["pulseaudio", "-k"], env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=5)
+    except Exception as ex:
+        log("自愈: pulseaudio -k 失败: %s" % ex)
+    time.sleep(1.5)
+    try:
+        subprocess.run(["pactl", "info"], env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=5)
+    except Exception as ex:
+        log("自愈: 重新拉起 PulseAudio 失败: %s" % ex)
+    try:
+        subprocess.run(["pactl", "unload-module", "module-suspend-on-idle"],
+                       env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=5)
+    except Exception as ex:
+        log("自愈: 卸载 suspend-on-idle 失败: %s" % ex)
+    _healed = True
+    _last_activity = time.time()
+
+
+# ─────────────────────── 录→识→贴 主流程 ───────────────────────
+def do_transcribe_and_paste(cfg, ui, e, raw):
+    global _last_activity
+    _last_activity = time.time()
+    secs = len(raw) / float(cfg["rate"] * 2 * cfg["channels"])
+    if secs < cfg.get("min_seconds", 0.4):
+        log("录音过短 (%.2fs)，忽略" % secs)
+        notify("录音太短", "长按音量下键多说一会儿", icon="dialog-warning", timeout=2500)
+        return
+
+    # 纯静音（全 0）= 麦克风采集路径失效（suspend→resume 坏）→ 自愈后提示重说
+    if raw and raw.count(0) == len(raw):
+        log("检测到纯静音（麦克风采集失效），执行自愈")
+        heal_mic(cfg)
+        notify("麦克风已修复", "刚才没录到声音，请再说一次",
+               icon="microphone", timeout=5000, urgency="critical")
+        return
+
+    notify("识别中…", "%.1f 秒音频" % secs, icon="emblem-synchronizing", timeout=0)
+    audio = pcm_to_opus(raw, cfg)
+    if len(raw):
+        log("音频压缩: PCM %d → 上传 %d 字节 (%.0f%%)"
+            % (len(raw), len(audio), len(audio) * 100.0 / len(raw)))
+    t0 = time.time()
+    ok, res = transcribe(audio, cfg)
+    dt = time.time() - t0
+
+    if not ok:
+        log("识别失败: %s" % res)
+        notify("识别失败", res, icon="dialog-error", timeout=5000, urgency="critical")
+        return
+
+    log("识别成功 (%.2fs): %s" % (dt, res))
+    if cfg.get("save_history", True):
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            with open(HISTORY, "a") as f:
+                f.write("%s\t%.1fs\t%s\n" % (
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"), secs, res))
+        except Exception:
+            pass
+
+    if not set_clipboard(res):
+        notify("已识别，但写剪贴板失败", res[:60], icon="dialog-warning", timeout=5000)
+        return
+
+    got = clipboard_read()
+    if got is not None and got != res:
+        log("⚠️ 剪贴板校验不一致: %r != %r" % (got[:40], res[:40]))
+
+    app = focused_app(cfg)
+    mods = cfg["paste_mods"]
+    terms = [t.lower() for t in (cfg.get("terminal_apps") or [])]
+    if app and app.lower() in terms:
+        mods = cfg.get("paste_mods_terminal") or mods
+        log("焦点应用 '%s' 是终端 -> %s" % (app, "+".join(mods)))
+    else:
+        log("焦点应用 '%s' -> %s" % (app or "未知", "+".join(mods)))
+
+    time.sleep(0.2)          # 等剪贴板所有权生效
+    inject_paste(ui, e, cfg, mods)
+    notify("已上屏", res[:60] + ("…" if len(res) > 60 else ""),
+           icon="emblem-ok-symbolic", timeout=2500)
+
+
+# ───────────────────────── 守护进程 ─────────────────────────
+def find_device(name_sub):
+    from evdev import InputDevice, list_devices
+    for p in list_devices():
+        try:
+            d = InputDevice(p)
+        except Exception:
+            continue
+        if name_sub.lower() in d.name.lower() and "voicetype" not in d.name.lower():
+            return d
+    return None
+
+
+def run_daemon(cfg):
+    from evdev import ecodes as e
+
+    if not cfg.get("api_key"):
+        log("❌ 未配置 api_key")
+        notify("VoiceType 未配置", "请先在 config.json 填 api_key", icon="dialog-error")
+        return 1
+
+    dev = find_device(cfg["trigger_device"])
+    if dev is None:
+        log("❌ 找不到触发设备: %s" % cfg["trigger_device"])
+        return 1
+    log("触发设备: %s (%s)" % (dev.name, dev.path))
+
+    ui = make_uinput(e, cfg)
+    log("uinput 虚拟键盘: %s" % ui.device.path)
+
+    grab = bool(cfg.get("grab", False))
+    if grab:
+        try:
+            dev.grab()
+            log("已独占 %s（音量键由本进程透传）" % dev.path)
+        except Exception as ex:
+            log("⚠️ grab 失败，退化为被动读取: %s" % ex)
+            grab = False
+    else:
+        log("被动读取 %s —— 不影响其它读取者，音量键仍由系统处理" % dev.path)
+
+    TRIG = getattr(e, cfg.get("trigger_key", "KEY_VOLUMEDOWN"))
+    hold = cfg["hold_ms"] / 1000.0
+    maxsec = cfg["max_seconds"]
+
+    # 长按音量上 = 回车
+    enter_enabled = bool(cfg.get("enter_enabled", True))
+    ENTER_KEY = getattr(e, cfg.get("enter_key", "KEY_VOLUMEUP"))
+    enter_hold = float(cfg.get("enter_hold_ms", cfg["hold_ms"])) / 1000.0
+
+    press_t = None
+    rec = None
+    rec_t = None
+    enter_press_t = None
+    enter_fired = False
+    handled_keys = (TRIG, ENTER_KEY) if enter_enabled else (TRIG,)
+
+    def shutdown(sig, frame):
+        log("收到信号 %s，退出" % sig)
+        try:
+            dev.ungrab()
+        except Exception:
+            pass
+        try:
+            ui.close()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, shutdown)
+
+    log("就绪：长按 %s (>=%dms) 说话，松开上屏" % (cfg.get("trigger_key"), cfg["hold_ms"]))
+    if enter_enabled:
+        log("      长按 %s (>=%dms) 注入回车" % (
+            cfg.get("enter_key", "KEY_VOLUMEUP"),
+            cfg.get("enter_hold_ms", cfg["hold_ms"])))
+        notify("VoiceType 已就绪", "长按音量下说话；长按音量上回车",
+               icon="microphone", timeout=2500)
+    else:
+        notify("VoiceType 已就绪", "长按音量下键说话", icon="microphone", timeout=2500)
+
+    try:
+        while True:
+            r, _, _ = select.select([dev], [], [], 0.1)
+
+            for ev in (dev.read() if r else []):
+                if ev.type != e.EV_KEY:
+                    continue
+
+                # 独占模式下，非触发键要转发回系统（否则音量键失灵）
+                if grab and ev.code not in handled_keys:
+                    ui.write(e.EV_KEY, ev.code, ev.value)
+                    ui.syn()
+                    continue
+
+                # ── 长按音量上 = 回车 ──
+                if enter_enabled and ev.code == ENTER_KEY:
+                    if ev.value == 1:                       # 按下
+                        if enter_press_t is None:
+                            enter_press_t = time.time()
+                            enter_fired = False
+                    elif ev.value == 0:                     # 松开
+                        if enter_press_t is not None:
+                            held = (time.time() - enter_press_t) * 1000
+                            enter_press_t = None
+                            if not enter_fired:
+                                log("短按音量上 %.0fms -> 忽略（音量正常调节）" % held)
+                                if grab:
+                                    ui.write(e.EV_KEY, ENTER_KEY, 1); ui.syn()
+                                    time.sleep(0.03)
+                                    ui.write(e.EV_KEY, ENTER_KEY, 0); ui.syn()
+                            enter_fired = False
+                    continue
+
+                if ev.code != TRIG:
+                    continue
+
+                if ev.value == 1:                       # 按下
+                    if rec is None and press_t is None:
+                        press_t = time.time()
+
+                elif ev.value == 0:                     # 松开
+                    if rec is not None:
+                        raw = rec_stop(rec[0], rec[1])
+                        rec = None; rec_t = None; press_t = None
+                        do_transcribe_and_paste(cfg, ui, e, raw)
+                    elif press_t is not None:
+                        held = (time.time() - press_t) * 1000
+                        press_t = None
+                        log("短按 %.0fms -> 忽略（音量正常调节）" % held)
+                        if grab:
+                            ui.write(e.EV_KEY, TRIG, 1); ui.syn()
+                            time.sleep(0.03)
+                            ui.write(e.EV_KEY, TRIG, 0); ui.syn()
+
+            # 长按音量上 -> 回车
+            if enter_enabled and enter_press_t is not None and not enter_fired:
+                if time.time() - enter_press_t >= enter_hold:
+                    enter_fired = True
+                    log("长按音量上 -> 注入回车")
+                    inject_enter(ui, e)
+                    notify("回车", "已发送 Enter", icon="emblem-ok-symbolic",
+                           timeout=2000)
+
+            # 长按判定
+            if press_t is not None and rec is None:
+                if time.time() - press_t >= hold:
+                    log("长按触发 -> 开始录音")
+                    notify("录音中…", "松开按钮结束", icon="microphone",
+                           timeout=0, urgency="critical")
+                    rec = rec_start(cfg)
+                    rec_t = time.time()
+
+            # 超长自动收尾
+            if rec is not None and rec_t is not None and time.time() - rec_t >= maxsec:
+                log("达到上限 %ds，自动结束" % maxsec)
+                raw = rec_stop(rec[0], rec[1])
+                rec = None; rec_t = None; press_t = None
+                do_transcribe_and_paste(cfg, ui, e, raw)
+
+            # 自愈后空闲过久 → 把 suspend-on-idle 装回去，恢复省电
+            idle_reload = float(cfg.get("suspend_reload_idle", 900) or 0)
+            if _healed and idle_reload > 0 and (time.time() - _last_activity) >= idle_reload:
+                reload_suspend(cfg)
+    finally:
+        try:
+            dev.ungrab()
+        except Exception:
+            pass
+        try:
+            ui.close()
+        except Exception:
+            pass
+
+
+# ───────────────────────── 子命令 ─────────────────────────
+def cmd_devices():
+    from evdev import InputDevice, list_devices, ecodes as e
+    print("输入设备：")
+    for p in sorted(list_devices()):
+        try:
+            d = InputDevice(p)
+            names = [e.KEY[k].decode() if isinstance(e.KEY[k], bytes) else str(k)
+                     for k in d.capabilities().get(1, []) if k in e.KEY]
+            print("  %-20s %-34s %s" % (p, d.name[:32], ",".join(names[:6])))
+        except Exception as ex:
+            print("  %-20s <读取失败 %s>" % (p, ex))
+    return 0
+
+
+def cmd_record(cfg, secs):
+    from evdev import ecodes as e
+    log("手动录音 %.1f 秒…" % secs)
+    ui = make_uinput(e, cfg)
+    p, f = rec_start(cfg)
+    time.sleep(secs)
+    raw = rec_stop(p, f)
+    log("采集 %d 字节" % len(raw))
+    do_transcribe_and_paste(cfg, ui, e, raw)
+    ui.close()
+    return 0
+
+
+def cmd_check(cfg):
+    ok = True
+    print("── 配置 ──")
+    print("  config      : %s %s" % (CONFIG_FILE, "✅" if CONFIG_FILE.exists() else "❌"))
+    print("  api_key     : %s" % ("✅ 已设置 (%s…)" % cfg["api_key"][:8] if cfg["api_key"] else "❌ 未设置"))
+    print("  resource_id : %s" % cfg["resource_id"])
+    print("  trigger     : 长按 %s >= %dms  (grab=%s)" % (cfg["trigger_key"], cfg["hold_ms"], cfg.get("grab")))
+    print("  enter       : 长按 %s >= %dms -> 回车 (%s)" % (
+        cfg.get("enter_key", "KEY_VOLUMEUP"),
+        cfg.get("enter_hold_ms", cfg["hold_ms"]),
+        "开" if cfg.get("enter_enabled", True) else "关"))
+    print("  paste       : %s + %s" % ("+".join(cfg["paste_mods"]), cfg["paste_key"]))
+
+    print("── 依赖 ──")
+    try:
+        import evdev  # noqa
+        print("  python-evdev : ✅")
+    except ImportError:
+        print("  python-evdev : ❌"); ok = False
+    for b in ("parec", "wl-copy", "notify-send"):
+        rc = subprocess.run(["which", b], capture_output=True).returncode
+        print("  %-12s : %s" % (b, "✅" if rc == 0 else "❌"))
+        if rc != 0:
+            ok = False
+
+    print("── 设备 ──")
+    d = find_device(cfg["trigger_device"])
+    print("  触发设备     : %s" % (("%s (%s) ✅" % (d.name, d.path)) if d else "❌ " + cfg["trigger_device"]))
+    if not d:
+        ok = False
+    print("  /dev/uinput  : %s" % ("✅ 可写" if os.access("/dev/uinput", os.W_OK) else "❌ 不可写"))
+
+    print("── 会话 ──")
+    env = session_env()
+    for k in _SESSION_KEYS:
+        print("  %-24s: %s" % (k, env.get(k, "❌ 缺失")))
+
+    print("── 剪贴板 ──")
+    print("  wl-copy 写入 : %s" % ("✅" if set_clipboard("voicetype-check") else "❌"))
+
+    print("── 焦点检测 ──")
+    helper = cfg.get("focus_helper") or "wt-focus"
+    hp = shutil.which(helper) or os.path.expanduser("~/.local/bin/" + helper)
+    print("  %-12s : %s" % (helper, ("✅ " + hp) if os.path.exists(hp)
+                                 else "⚠️ 未找到（将固定用 Ctrl+V）"))
+    fa = focused_app(cfg)
+    print("  当前焦点应用 : %s" % (fa if fa else "（查不到）"))
+    terms = [t.lower() for t in (cfg.get("terminal_apps") or [])]
+    print("  将使用       : %s" % ("Ctrl+Shift+V（终端）" if (fa and fa.lower() in terms)
+                                     else "Ctrl+V"))
+
+    print("── API ──")
+    raw = b"\0" * (cfg["rate"] * 2)
+    okr, res = transcribe(pcm_to_wav(raw, cfg), cfg)
+    print("  结果         : %s" % (("✅ " + res) if okr else "（静音为预期）" + res))
+    return 0 if ok else 1
+
+
+USAGE = """VoiceType — 长按音量键说话，松手自动上屏
+
+  voicetype                启动守护进程
+  voicetype --record N     手动录 N 秒并粘贴（调试）
+  voicetype --devices      列出输入设备
+  voicetype --check        自检
+  voicetype --config       打印当前配置
+"""
+
+
+def main():
+    global ENV
+    ENV = session_env()
+    args = sys.argv[1:]
+    cfg = load_config()
+
+    if not args:
+        return run_daemon(cfg)
+    a = args[0]
+    if a in ("-h", "--help"):
+        print(USAGE); return 0
+    if a == "--devices":
+        return cmd_devices()
+    if a == "--check":
+        return cmd_check(cfg)
+    if a == "--config":
+        print(json.dumps({**cfg,
+                          "api_key": (cfg["api_key"][:8] + "…") if cfg["api_key"] else ""},
+                         indent=2, ensure_ascii=False))
+        return 0
+    if a == "--record":
+        return cmd_record(cfg, float(args[1]) if len(args) > 1 else 5.0)
+    print("未知参数: %s\n" % a)
+    print(USAGE)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        log("💥 未捕获异常:\n" + traceback.format_exc())
+        sys.exit(1)

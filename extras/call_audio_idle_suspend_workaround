@@ -1,0 +1,58 @@
+#!/bin/sh
+# call_audio_idle_suspend_workaround（本地修改版）
+# --------------------------------------------------
+# 原版（/usr/sbin/）在通话结束后无条件 `pactl load-module module-suspend-on-idle`，
+# 会把用户为修复麦克风而故意卸载的 suspend-on-idle 又装回去 → 通话后麦克风静音。
+#
+# 本版改动：记录「通话开始前」suspend-on-idle 是否处于加载状态，
+#           通话结束后只在「本来就是加载状态」时才恢复，
+#           从而不破坏用户级修复（~/.config/pulse/default.pa）。
+
+# dbus-monitor is run as a child process to this script. Kill child process too when the script terminates.
+trap 'pkill -9 -P $$ && exit 0' INT TERM
+
+interface=org.freedesktop.ModemManager1.Call
+member=StateChanged
+
+dbus-monitor --system "type='signal',interface='$interface',member='$member'" |
+	while read -r line; do
+		state=$(echo "$line" | awk '/\<int32\>/ {print $2}')
+		if [ -n "$state" ]; then
+			# Call State is based on https://www.freedesktop.org/software/ModemManager/doc/latest/ModemManager/ModemManager-Flags-and-Enumerations.html#MMCallState
+			if [ "$state" -eq '0' ] || [ "$state" -eq '3' ]; then
+				echo "Call Started"
+
+				# 记录通话前 suspend-on-idle 的加载状态
+				if pactl list modules short 2>/dev/null | grep -q module-suspend-on-idle; then
+					SUSPEND_WAS_LOADED=1
+				else
+					SUSPEND_WAS_LOADED=0
+				fi
+
+				# Unload module-suspend-on-idle when call begins
+				pidof pulseaudio && pactl unload-module module-suspend-on-idle
+
+				# With Wireplumber audio, the Pulseaudio
+				# compatibility layer doesn't support
+				# loading/unloading the suspend module. Add
+				# loopback sinks and sources instead.
+				sleep 1
+				pw-loopback -m '[FL FR]' --capture-props='media.class=Audio/Sink' &
+				pw-loopback -m '[FL FR]' --playback-props='media.class=Audio/Source' &
+			fi
+
+			if [ "$state" -eq '7' ]; then
+				echo "Call Ended"
+				killall -9 pw-loopback &
+
+				# Reload module-suspend-on-idle after call ends —— 仅当通话前是加载状态时
+				if [ "${SUSPEND_WAS_LOADED:-1}" = "1" ]; then
+					pidof pulseaudio && pactl load-module module-suspend-on-idle
+				else
+					echo "skip reloading suspend-on-idle (was not loaded before call)"
+				fi
+			fi
+		fi
+	done &
+
+wait
