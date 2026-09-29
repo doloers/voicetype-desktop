@@ -109,6 +109,10 @@ tail -f /tmp/voicetype.log          # 详细日志
   `/etc/udev/rules.d/70-voicetype-uinput.rules`（`MODE=0660 GROUP=input TAG+="uaccess"`，
   给当前登录会话加 ACL，不必把用户加进 `input` 组）、写 `modules-load.d/uinput.conf`。
   - 规则文件名必须是 `70-*`：`TAG+="uaccess"` 要早于 `73-seat-late.rules` 才会被消费成 ACL。
+- **只靠 uaccess 不够**：模块在 sysinit 就加载、设备节点随即创建，那时用户会话还没激活、ACL 还没落；
+  所以规则里另写了 `OWNER=<用户>`，开机时服务一启动就有写权限。
+- 顺带一个写脚本的坑：`set -o pipefail` 下不要用 `lsmod | grep -q xxx` 判断模块是否加载 ——
+  `grep -q` 命中即早退，`lsmod` 吃到 SIGPIPE 变成 141，整条管道被判为失败（假阴性）。
 - 本机特殊情况：运行内核是 7.2.6 而磁盘上只有 7.2.7 的模块（已更新未重启），
   `modprobe uinput` 找不到模块；脚本会从 pacman 缓存里的旧内核包取出 `uinput.ko` 直接
   `insmod`（版本一致所以能加载），不用为语音输入专门重启；重启后靠 `modules-load.d` 自动加载。

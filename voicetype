@@ -122,6 +122,7 @@ DEFAULT_CONFIG = {
     "voice_chunks": 3,          # 连续多少个 100ms 超阈值才算「真的在说话」（防噪声误触）
     "wtype_delay_ms": 30,       # wtype 注入时按住修饰键的时长（有些应用需要）
     "heal_mic": False,          # 采集失效时重启 PulseAudio（手机需要，桌面默认关）
+    "injector_retries": 10,     # 启动时注入器初始化重试次数（开机时 /dev/uinput 可能还没就绪）
 }
 
 
@@ -1079,7 +1080,20 @@ class Server:
             pass
 
     def run(self):
-        self.inj = make_injector(self.cfg)
+        # 开机/刚登录时 /dev/uinput 可能还没就绪（内核模块还在加载、ACL 还没落），
+        # 所以注入器初始化要重试几次，别让一两次失败把服务弄死。
+        retries = max(1, int(self.cfg.get("injector_retries", 10) or 1))
+        for attempt in range(retries):
+            try:
+                self.inj = make_injector(self.cfg)
+                break
+            except Exception as ex:
+                log("注入器初始化失败 (%d/%d): %s" % (attempt + 1, retries, ex))
+                if attempt < retries - 1:
+                    time.sleep(3)
+        if self.inj is None:
+            log("❌ 无法初始化注入器，退出（systemd 会自动重启）")
+            return 1
         if os.path.exists(self.path):
             try:
                 os.unlink(self.path)

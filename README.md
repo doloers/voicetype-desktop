@@ -64,6 +64,36 @@ niri validate && niri msg action load-config-file
 
 装完按 `Mod+V` 即可用。自检：`voicetype --check`；日志：`tail -f /tmp/voicetype.log`。
 
+## 开机自启动
+
+安装脚本已经把它接进**图形会话**（登录后自动起，不用手动开）：
+
+```bash
+systemctl --user is-enabled voicetype-desktop        # enabled
+systemctl --user list-dependencies graphical-session.target | grep voicetype
+# optional: 看看它到底什么时候起、有没有成功
+systemctl --user status voicetype-desktop
+journalctl --user -u voicetype-desktop -b
+```
+
+开机链路是这样串起来的，三个点都别漏：
+
+| 环节 | 谁负责 | 怎么验证 |
+|---|---|---|
+| `uinput` 内核模块 | `/etc/modules-load.d/uinput.conf`（`setup-uinput-desktop.sh` 写） | `lsmod \| grep uinput`，`ls /dev/uinput` |
+| `/dev/uinput` 权限 | `/etc/udev/rules.d/70-voicetype-uinput.rules`：`OWNER=<你>` + `TAG+="uaccess"` | `ls -l /dev/uinput` 应显示属主是你 |
+| 服务随会话启动 | `systemctl --user enable voicetype-desktop`（`WantedBy=graphical-session.target`） | 上面两条命令 |
+
+两个容易踩的点，脚本都已经处理：
+
+- **权限不能只靠会话 ACL**：内核模块在 sysinit 阶段就加载、设备节点随即创建，那时用户会话还没激活，
+  `uaccess` ACL 还没落下来。所以规则里写了 `OWNER=<你>`，服务启动时直接就有写权限。
+  （另外规则必须叫 `70-*`：`TAG+="uaccess"` 要早于 `73-seat-late.rules` 才会被消费成 ACL。）
+- **启动时 `/dev/uinput` 可能还没就绪**：守护进程对注入器初始化做了重试（默认 10 次 × 3 秒），
+  失败也不会把自己弄死；systemd 侧还有 `Restart=on-failure`。
+
+关掉自启动：`systemctl --user disable --now voicetype-desktop`。
+
 ## 用法
 
 ```bash
@@ -103,6 +133,7 @@ journalctl --user -u voicetype-desktop -f      # 或 tail -f /tmp/voicetype.log
 | `opus_bitrate` | `24` | OPUS 码率（kbps），`0` = 直接传 WAV |
 | `notify` / `save_history` | `true` | 桌面通知 / 保存识别历史 |
 | `mode` | `desktop` | 只影响 `--check` 的提示（桌面上不要求音量键设备存在） |
+| `injector_retries` | `10` | 启动时注入器初始化重试次数（每次间隔 3s，防开机时 `/dev/uinput` 未就绪） |
 
 改完配置**不用重启服务**（每次开录前会重读）。
 
@@ -114,6 +145,7 @@ journalctl --user -u voicetype-desktop -f      # 或 tail -f /tmp/voicetype.log
 | 通知「没听到说话」 | 麦没声音：`pactl list short sources`、`voicetype --levels 5` 看电平 |
 | 通知「未配置 api_key」 | 填 `~/.config/voicetype/config.json` |
 | 识别成功但没上屏 | `voicetype --check` 看 `/dev/uinput` 是否可写（跑 `setup-uinput-desktop.sh`） |
+| 重启后按键没反应 | `systemctl --user status voicetype-desktop`；`ls -l /dev/uinput` 属主是否是你；`lsmod \| grep uinput` |
 | 提前自动收尾（还没说就停） | 环境噪声大：把 `silence_rms` 调高 或 `voice_chunks` 调大 |
 | API 报 `45000010` / `45000030` | Key 无效 / 能力未开通（豆包控制台「开通管理」） |
 
