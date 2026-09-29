@@ -1,133 +1,144 @@
-# VoiceType
+# VoiceType Desktop
 
-> 长按音量键说话，松手自动转文字并上屏 —— 为 Linux 手机（postmarketOS / Phosh）打造。
+> **按一下快捷键说话，松手（或停嘴）自动转文字并上屏** —— 为桌面 Linux / Wayland 打造的语音输入。
 
-在 OnePlus 6（Qualcomm SDM845）+ postmarketOS + Phosh 上开发并日常使用：**长按音量下键说话，松手后自动把识别结果粘贴到当前焦点窗口**。
+从 [VoiceType（手机版 pmos-voicetype）](https://github.com/doloers/pmos-voicetype) 移植而来：
+把「长按音量键」换成**合成器快捷键**，把 `/dev/uinput` 之外的注入方式也补齐，
+并按桌面场景重做了静音收尾、缓冲延迟等细节。在 **Arch Linux + niri 26.04 + PipeWire**、
+ThinkPad X1 Carbon 上开发并日常使用。
 
-> 想在**桌面 Linux（Arch + niri 等 wlroots 系合成器）**上用快捷键语音输入？
-> 见 **[DESKTOP.md](DESKTOP.md)** —— 同一份程序多一个 `--serve` 模式，
-> 不需要 root/evdev/uinput，文字仍走剪贴板 + 虚拟键盘上屏。
+```
+按 Mod+V  ──►  parec 录音（16kHz/16bit/mono，流式）
+                 ├─ 停嘴 ~1.2s 自动收尾（也可以再按一次 Mod+V）
+                 ├─ PCM → OGG OPUS（opusenc，失败自动回退 WAV）
+                 ├─ 豆包语音识别（volc.seedasr.auc 大模型 flash 接口）
+                 └─ 结果写 wl-copy 剪贴板 → uinput 虚拟键盘发 Ctrl+V 上屏
+                     （终端里自动改用 Ctrl+Shift+V）
+```
 
 ## 特性
 
-- 🎤 **长按音量下键** → 录音；松开 → 语音识别 → 自动上屏
-- ⏎ **长按音量上键** → 注入一次回车（Enter）
-- 🔊 **短按音量键** → 忽略（音量照常调节；采用被动读取，不抢占设备）
-- 🖥️ **智能粘贴**：终端自动用 `Ctrl+Shift+V`，其它应用用 `Ctrl+V`
-- 🔁 **网络重试**：识别请求遇到瞬时网络/域名解析故障自动退避重试
-- 🩺 **麦克风自愈**：录音为纯静音（采集路径失效）时自动重启 PulseAudio 修复并提示重说
-- 🗜️ **OPUS 压缩**：上传前把 PCM 压成 OGG OPUS（约为 WAV 的 1/8），识别更快、更省流量
-- 📝 **历史记录**：可选保存每次识别结果
-
-## 工作原理
-
-```
-长按音量下键
-   └─ parec 录音（16kHz / 16bit / mono）
-         └─ 松开
-              ├─ PCM → OGG OPUS（opusenc，失败自动回退 WAV）
-              ├─ 调用豆包语音识别（volc.seedasr.auc 大模型 flash 接口）
-              └─ 结果写入剪贴板 → 用 /dev/uinput 虚拟键盘发送 Ctrl+V
-```
-
-> **为什么用 uinput + 剪贴板，而不是 `wtype`？**
-> 剪贴板天然是 UTF-8，中文/emoji 不会出问题；`uinput` 虚拟键盘只负责发 `Ctrl+V` 这类按键组合。
+- ⌨️ **快捷键开关**：按一次开始录音，再按一次结束；停嘴静音自动收尾，连第二次都省
+- 🧠 **场景自适应粘贴**：用 `niri msg` 查焦点窗口，终端自动 `Ctrl+Shift+V`，其它应用 `Ctrl+V`
+- 🀄 **中文/emoji 天然安全**：文字走剪贴板（UTF-8），虚拟键盘只负责发组合键
+- 🎚️ **静音自动收尾可校准**：`voicetype --levels 5` 打电平统计，`silence_rms` / `silence_ms` / `voice_chunks` 三个旋钮
+- 🔁 **网络重试**：识别请求遇瞬时故障退避重试；失败/静音都有桌面通知
+- 🩺 **自检**：`voicetype --check` 一次查依赖、设备、权限、会话环境、剪贴板、焦点检测、API
+- 📝 **历史记录**：可选保存每次识别结果到 `~/.local/share/voicetype/history.log`
+- 📱 **手机模式保留**：同一份程序不带参数启动仍是上游的音量键模式（见 `phone-mode/`）
 
 ## 依赖
 
 | 类型 | 依赖 | 说明 |
 |------|------|------|
-| Python | `evdev` | 读取音量键、创建虚拟键盘 |
-| 命令 | `parec` | 录音（PulseAudio / PipeWire） |
+| 命令 | `parec` | 录音（pipewire-pulse / PulseAudio） |
 | 命令 | `wl-copy` / `wl-paste` | 剪贴板（wl-clipboard） |
-| 命令 | `notify-send` | 通知提示 |
-| 可选 | `opusenc`（opus-tools） | 音频压缩；**没有则自动回退 WAV** |
-| 可选 | `wt-focus` | 检测焦点应用以决定粘贴组合键 |
+| 命令 | `notify-send` | 通知提示（libnotify） |
+| 命令 | `niri` | 查焦点窗口（用别的合成器可换 `focus_helper`） |
+| Python | `python-evdev` | 创建 `/dev/uinput` 虚拟键盘 |
+| 可选 | `opusenc`（opus-tools） | 上传前压缩，体积约为 WAV 的 1/10；没装则直传 WAV |
 
-另外需要系统允许写入 `/dev/uinput`（通常通过 sudoers 或 udev 规则授权）。
+> 也支持 `injector: wtype`（`zwp_virtual_keyboard`，无需 root），但**在 niri 上实测注入不进终端**，
+> 细节见 [NOTES.md](NOTES.md#1-wtype-在-niri-上注入不进终端所以默认改用-uinput)。
 
 ## 安装
 
 ```bash
-# 1. 主程序
-install -Dm755 voicetype ~/.local/bin/voicetype
+git clone https://github.com/doloers/voicetype-desktop.git
+cd voicetype-desktop
 
-# 2. 配置
-mkdir -p ~/.config/voicetype
-cp config.example.json ~/.config/voicetype/config.json
-$EDITOR ~/.config/voicetype/config.json        # 填入 api_key 等
+# 1) 用户级安装：程序 + systemd 用户服务 + 配置模板
+bash install-desktop.sh
 
-# 3. systemd 用户服务
-mkdir -p ~/.config/systemd/user
-cp systemd/voicetype.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now voicetype.service
+# 2) 一次性 root 配置：装 python-evdev、给 /dev/uinput 放行、开机自动加载 uinput
+#    （只写 2 个文件，不动 sudoers，不需要把用户加入 input 组）
+sudo bash setup-uinput-desktop.sh
 
-# 4. 查看日志
-journalctl --user -u voicetype.service -f
-# 或
-tail -f /tmp/voicetype.log
+# 3) 填 API Key（豆包语音控制台 → 录音文件识别大模型 → X-Api-Key）
+$EDITOR ~/.config/voicetype/config.json      # "api_key": "……"
+
+# 4) 加快捷键（~/.config/niri/config.kdl 的 binds 段）
+#    Mod+V { spawn-sh "voicetype --toggle"; }
+niri validate && niri msg action load-config-file
 ```
 
-## 配置
+装完按 `Mod+V` 即可用。自检：`voicetype --check`；日志：`tail -f /tmp/voicetype.log`。
 
-配置文件：`~/.config/voicetype/config.json`（见 `config.example.json`）
-
-| 键 | 默认 | 说明 |
-|----|------|------|
-| `api_key` | — | 豆包语音 API Key（**必需**） |
-| `resource_id` | `volc.seedasr.auc` | 豆包资源 ID（录音文件识别大模型 2.0） |
-| `endpoint` | `…/recognize/flash` | 识别接口地址 |
-| `trigger_device` | `Volume keys` | 触发的 evdev 设备名 |
-| `trigger_key` | `KEY_VOLUMEDOWN` | 长按此键录音 |
-| `enter_key` | `KEY_VOLUMEUP` | 长按此键注入回车 |
-| `hold_ms` | `400` | 长按判定阈值（ms） |
-| `enter_hold_ms` | `400` | 回车触发的长按阈值（ms） |
-| `max_seconds` | `120` | 单次录音上限（秒） |
-| `min_seconds` | `0.4` | 太短则忽略（秒） |
-| `paste_mods` | `["LEFTCTRL"]` | 普通应用粘贴组合键 |
-| `paste_mods_terminal` | `["LEFTCTRL","LEFTSHIFT"]` | 终端粘贴组合键 |
-| `terminal_apps` | `[...]` | 判定为终端的 app_id 列表 |
-| `opus_bitrate` | `24` | OPUS 码率（kbps）；**`0` 则直接传 WAV** |
-| `suspend_reload_idle` | `900` | 自愈后空闲多少秒恢复 `suspend-on-idle`（省电）；`0` 不恢复 |
-| `grab` | `false` | 是否独占音量键（`false` 时不影响系统音量调节） |
-| `notify` | `true` | 是否弹通知 |
-| `save_history` | `true` | 是否保存识别历史 |
-
-## 参数
+## 用法
 
 ```bash
-voicetype               # 启动守护进程（正常用法）
-voicetype --record N    # 手动录 N 秒并粘贴（调试）
-voicetype --devices     # 列出输入设备
-voicetype --check       # 自检
-voicetype --config      # 打印当前配置
+voicetype                 # 手机模式守护进程（音量键）
+voicetype --serve         # 桌面模式守护进程（socket，一般由 systemd 拉起）
+voicetype --toggle        # 开始 / 停止录音（绑定到快捷键）
+voicetype --start/--stop  # 只开始 / 只停止
+voicetype --status        # 看当前状态
+voicetype --enter         # 注入一次回车（想的话可以再绑一个键）
+voicetype --check         # 自检
+voicetype --levels N      # 录 N 秒打电平统计（校准静音阈值）
+voicetype --record N      # 录 N 秒 → 识别 → 上屏（调试）
 ```
 
-## 平台特定说明
+服务管理：
 
-本机为 OnePlus 6 / SDM845 的 postmarketOS，部分逻辑与平台相关，见 `extras/`：
+```bash
+systemctl --user status voicetype-desktop
+systemctl --user restart voicetype-desktop
+journalctl --user -u voicetype-desktop -f      # 或 tail -f /tmp/voicetype.log
+```
 
-- **`extras/call_audio_idle_suspend_workaround`**
-  postmarketOS 自带的通话 workaround 会在通话结束后**无条件重装** `module-suspend-on-idle`，
-  会让通话后的首次录音失效。本地版改为「记录通话前状态，仅在原本加载时才恢复」，避免无谓失效。
-  用法：覆盖发行版服务（systemd drop-in）。
+## 配置 `~/.config/voicetype/config.json`
 
-- **`extras/mic-autofix.sh`**（**已停用，仅留档**）
-  早期的「开机检测麦克风、静音则禁用 suspend-on-idle」方案。因为麦克风可能在开机**之后**才失效，
-  该方案存在盲区，已被主程序内的**自愈**逻辑取代。
+见 [`config.desktop.example.json`](config.desktop.example.json)，桌面相关键：
 
-### 关于麦克风「挂起→唤醒失效」
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `api_key` | — | **必填**，豆包语音控制台的 API Key |
+| `injector` | `uinput` | `uinput`（推荐） / `wtype` |
+| `focus_helper` | `niri` | 用 `niri msg --json focused-window` 查焦点应用 |
+| `auto_stop` / `silence_ms` / `silence_rms` / `voice_chunks` | `true` / `1200` / `300` / `3` | 静音自动收尾；`voice_chunks` = 连续多少个 100ms 超阈值才算「真在说话」（防按键/通知声误触） |
+| `latency_ms` | `20` | `parec --latency-msec`；**别设 0**（默认会丢开头 ~2 秒） |
+| `max_seconds` / `min_seconds` | `120` / `0.4` | 单次录音上限 / 太短忽略 |
+| `paste_mods` / `paste_mods_terminal` / `paste_key` | `Ctrl` / `Ctrl+Shift` / `V` | 上屏组合键 |
+| `terminal_apps` | `foot, alacritty, kitty, …` | 判定为终端的 app_id 列表 |
+| `opus_bitrate` | `24` | OPUS 码率（kbps），`0` = 直接传 WAV |
+| `notify` / `save_history` | `true` | 桌面通知 / 保存识别历史 |
+| `mode` | `desktop` | 只影响 `--check` 的提示（桌面上不要求音量键设备存在） |
 
-本机 WCD934x 的采集路径在 `module-suspend-on-idle` 把麦克风挂起后再唤醒时**偶发失效**（录出纯数字静音）。
-主程序的处理方式：录音结束若发现 PCM 全为 0，则自动
-`重启 PulseAudio + 卸载 module-suspend-on-idle` 并弹窗提示重说；之后空闲一段时间再自动把
-`suspend-on-idle` 装回去以省电（见 `suspend_reload_idle`）。这样在**可靠**与**省电**之间取平衡。
+改完配置**不用重启服务**（每次开录前会重读）。
 
-## 更新日志
+## 排障
 
-见 [CHANGELOG.md](CHANGELOG.md)。
+| 现象 | 处理 |
+|---|---|
+| 按快捷键没反应 | `systemctl --user status voicetype-desktop`；`tail -20 /tmp/voicetype.log` |
+| 通知「没听到说话」 | 麦没声音：`pactl list short sources`、`voicetype --levels 5` 看电平 |
+| 通知「未配置 api_key」 | 填 `~/.config/voicetype/config.json` |
+| 识别成功但没上屏 | `voicetype --check` 看 `/dev/uinput` 是否可写（跑 `setup-uinput-desktop.sh`） |
+| 提前自动收尾（还没说就停） | 环境噪声大：把 `silence_rms` 调高 或 `voice_chunks` 调大 |
+| API 报 `45000010` / `45000030` | Key 无效 / 能力未开通（豆包控制台「开通管理」） |
+
+更多实测细节（为什么不用 wtype、`ID_INPUT_KEYBOARD` 标签、`uaccess` 规则顺序、`parec` 缓冲）
+见 **[NOTES.md](NOTES.md)**。
+
+## 目录结构
+
+```
+voicetype                       主程序（桌面模式 + 手机模式，单文件 Python）
+install-desktop.sh              桌面安装（用户级）
+setup-uinput-desktop.sh         /dev/uinput 一次性 root 配置
+config.desktop.example.json     桌面配置模板
+systemd/voicetype-desktop.service
+NOTES.md                        实测笔记与踩坑记录
+phone-mode/                     上游手机模式（音量键）：install.sh / config / systemd / extras
+```
+
+## 与上游的关系
+
+上游 [pmos-voicetype](https://github.com/doloers/pmos-voicetype) 是给 Linux 手机
+（postmarketOS / Phosh）写的。本项目把触发从 evdev 音量键改成合成器快捷键、
+注入改为可插拔（`uinput` / `wtype`）、录音改流式并加静音收尾，其余（识别、剪贴板、重试、通知、
+自愈开关）沿用。手机模式代码路径保持兼容，`voicetype` 不带参数即还原上游行为。
 
 ## 许可
 
-MIT
+[MIT](LICENSE) © 2026 doloers

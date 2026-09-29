@@ -1,9 +1,11 @@
-# VoiceType 桌面版（Arch + niri + PipeWire）
+# VoiceType Desktop —— 实测笔记与踩坑记录
+
+环境：Arch Linux + niri 26.04 + PipeWire，ThinkPad X1 Carbon Gen 14。
 
 上游项目 [`doloers/pmos-voicetype`](https://github.com/doloers/pmos-voicetype) 是为
 **Linux 手机（postmarketOS / Phosh / OnePlus 6）** 写的：长按音量键录音、松手识别、自动上屏。
 
-这份分支把它搬到**笔记本桌面**上，用**合成器快捷键**取代音量键。改动尽量小、可直接回合上游。
+本项目把它搬到**桌面**上，用**合成器快捷键**取代音量键。改动尽量小、手机模式仍兼容。
 
 ## 一、原版是怎么工作的（研究结论）
 
@@ -36,12 +38,14 @@
 | `parec` 默认缓冲 | **加 `--latency-msec=20`** | 实测：不加时 parec 攒 ~2s 才吐数据，**开头 2 秒直接丢** |
 | 全 0 就重启 PulseAudio | 默认关闭（`heal_mic:false`），只弹提示 | PipeWire 上没有手机上那个挂起失效的毛病 |
 | 服务 `voicetype.service` | `voicetype-desktop.service`（`--serve`） | 两者的 `ExecStart` 不同，互不干扰 |
+| 上游目录 `extras/`、手机安装脚本 | 归到 `phone-mode/` | 和桌面用法分开，避免混淆 |
 
 ## 三、用法
 
 ```bash
 # 1) 安装（用户级，不需要 root）
 bash install-desktop.sh
+sudo bash setup-uinput-desktop.sh
 
 # 2) uinput 注入需要的一次性 root 配置（装 python-evdev + 给 /dev/uinput 放行 + 开机加载 uinput）
 sudo bash setup-uinput-desktop.sh
@@ -131,5 +135,6 @@ tail -f /tmp/voicetype.log          # 详细日志
 
 改动集中在 `voicetype` 一个文件里（用 `injector` 抽象注入方式、`Recorder` 抽象录音、
 新增 `--serve/--toggle/--start/--stop/--status/--enter` 和 `Server`/`ctl`），
-另加 `systemd/voicetype-desktop.service`、`install-desktop.sh`、`config.desktop.example.json`、
-本文件。上游手机模式（无参数 = evdev 守护进程）行为保持不变，可直接提 PR。
+另加 `systemd/voicetype-desktop.service`、`install-desktop.sh`、`setup-uinput-desktop.sh`、
+`config.desktop.example.json`、本文件。上游手机模式（无参数 = evdev 守护进程）行为保持不变，
+手机相关文件归在 `phone-mode/`。

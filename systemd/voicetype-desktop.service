@@ -1,6 +1,6 @@
 [Unit]
-Description=VoiceType — 桌面快捷键语音输入（socket 模式，由合成器快捷键驱动）
-Documentation=file:%h/AIworks/01-技术研究/2026-09-29_语音输入voicetype/DESKTOP.md
+Description=VoiceType Desktop — 快捷键语音输入（socket 模式）（socket 模式，由合成器快捷键驱动）
+Documentation=https://github.com/doloers/voicetype-desktop
 After=graphical-session.target
 PartOf=graphical-session.target
 

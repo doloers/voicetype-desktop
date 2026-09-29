@@ -4,7 +4,7 @@
 VoiceType — 长按音量键说话，松手自动上屏
 =========================================
 平台 : postmarketOS / Phosh (Wayland) — OnePlus 6 (sdm845)
-       桌面 Linux —— 由合成器快捷键驱动（niri/sway…），见 DESKTOP.md
+       桌面 Linux —— 由合成器快捷键驱动（niri 等），见 NOTES.md / README.md
 识别 : 豆包语音「录音文件识别」大模型  volc.seedasr.auc  (0.8 元/小时)
 注入 : 两种方案，由配置 injector 选择
        uinput = /dev/uinput 虚拟键盘（手机默认，需要 root/udev 授权）

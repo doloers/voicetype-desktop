@@ -1,48 +1,44 @@
 # 更新日志
 
-本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)（`主版本.次版本.修订号`）。
+本项目从 [VoiceType（手机版）](https://github.com/doloers/pmos-voicetype) 移植而来，独立发版。
+版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
 ---
 
-## [1.0.0] — 2026-09-22
+## [0.1.0] — 2026-09-29
 
-首个公开发布版本。
+首个版本：桌面 Linux / Wayland 上的快捷键语音输入。
 
 ### ✨ 功能
 
-- **长按音量下键** → 录音；松开 → 语音识别 → 自动粘贴到当前焦点窗口
-- **长按音量上键** → 注入一次回车（Enter）
-- **短按音量键** → 忽略（音量照常调节；被动读取，不抢占设备，不影响其它读取者）
-- **智能粘贴**：终端自动用 `Ctrl+Shift+V`，其它应用用 `Ctrl+V`（通过 `wt-focus` 检测焦点应用）
-- 识别结果写入剪贴板 + `/dev/uinput` 虚拟键盘注入 —— 中文 / emoji 天然安全（UTF-8）
-- 可选保存识别历史（`~/.local/share/voicetype/history.log`）
+- **快捷键开关**：`voicetype --toggle` 按一次开始、再按一次结束（配套 niri 绑定 `Mod+V`）；
+  守护进程用 Unix socket（`$XDG_RUNTIME_DIR/voicetype.sock`）收命令，
+  另有 `--start/--stop/--status/--enter`；服务没在跑时会自动 `systemctl --user start`
+- **静音自动收尾**：流式录音 + RMS 电平判定，说完静音 1.2s 自动结束；
+  `voice_chunks` 要求连续多个窗口超阈值才「武装」收尾，避免按键/通知声误触
+- **电平校准工具**：`voicetype --levels N` 打印环境电平统计，用来调 `silence_rms`
+- **可插拔注入**：`injector: uinput`（内核虚拟键盘，推荐）/ `wtype`（zwp_virtual_keyboard）
+- **焦点自适应粘贴**：`focus_helper: niri` 直接用 `niri msg --json focused-window`，
+  终端自动 `Ctrl+Shift+V`、其它应用 `Ctrl+V`（不再需要额外的 `wt-focus` 小工具）
+- 桌面模式下 `heal_mic` 默认关闭（重启 PulseAudio 是手机 WCD934x 的特有毛病）
+- `mode: desktop|phone`：桌面上自检不再要求音量键设备存在
 
-### 🩺 稳定性
+### 🐛 修复（都是实测出来的）
 
-- **网络重试加强**：识别请求最多重试 5 次、递增退避（1.5s → 3s → 4.5s → 4s），
-  应对瞬时网络/域名解析故障（`EAI_AGAIN`）
-- **麦克风采集自愈**：录音结束后若 PCM 全为 0（采集路径失效），自动
-  「重启 PulseAudio + 卸载 `module-suspend-on-idle`」并弹窗提示重说
-- **空闲恢复省电**：自愈后空闲 `suspend_reload_idle` 秒（默认 900）自动把
-  `suspend-on-idle` 装回，兼顾可靠与省电
+- **`parec` 不加 `--latency-msec` 会吃掉开头约 2 秒音频**：4s 请求只回 2s、首包 2.02s 才到；
+  加 `--latency-msec=20` 后首包 0.08s、丢 0.02s。手机上是长按空档所以一直没暴露
+- **uinput 设备必须声明整套标准键盘键位**：只声明少数几个键（哪怕 `A..Z`、`ESC+ENTER`）时，
+  udev 只给 `ID_INPUT=1` 而拿不到 `ID_INPUT_KEYBOARD=1`，libinput 会把按键**静默丢弃**
+- **`wtype -s` 收整数毫秒**（`atoi` 解析），传 `0.03` 会被当 0 报错
 
-### 🗜️ 性能
+### 📄 文档
 
-- **上传前 OGG OPUS 压缩**（`opus_bitrate`，默认 24 kbps，体积约为 WAV 的 1/8）；
-  未安装 `opusenc` 或压缩失败时**自动回退 WAV**，功能不受影响
-- 实测：本机约 32 倍实时（120 秒音频压缩耗时约 3.7 秒）
+- `NOTES.md`：移植前后的对照、为什么放弃 wtype、`uaccess` 规则顺序、
+  niri 没有「松键绑定」所以做不了按住说话等实测记录
 
-### 📱 平台适配（postmarketOS / Phosh / OnePlus 6）
+### ⚠️ 已知限制
 
-- `extras/call_audio_idle_suspend_workaround`
-  修正发行版 call-audio workaround 在**通话结束后无条件重装** `module-suspend-on-idle`
-  的问题（会导致通话后首次录音失效）；本地版改为「记录通话前状态，仅在原本加载时才恢复」。
-- `extras/mic-autofix.sh`（**已停用，仅留档**）
-  早期的「开机一次性检测麦克风」方案；因麦克风可能在开机**之后**才失效而存在盲区，
-  已被主程序内的**自愈**逻辑取代。
-
-### ⚠️ 已知问题
-
-- 本机 WCD934x 的采集路径在 `module-suspend-on-idle` 挂起后再唤醒时**偶发失效**
-  （录出纯数字静音）。已由上述「自愈 + 空闲恢复省电」机制处理，但首次失效时会提示重说一次。
-- 受上游接口限制，单次录音长度与体积上限以服务端为准；本项目默认上限 120 秒。
+- `wtype` 注入在 niri 26.04 上进不了终端（`foot`/`alacritty` 收不到，`fuzzel` 能收到），
+  所以桌面默认 `uinput`
+- 剪贴板会被识别结果覆盖
+- 依赖云识别接口（豆包 `volc.seedasr.auc`），需要 `api_key` 且要联网
