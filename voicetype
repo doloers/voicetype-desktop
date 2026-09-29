@@ -4,9 +4,12 @@
 VoiceType — 长按音量键说话，松手自动上屏
 =========================================
 平台 : postmarketOS / Phosh (Wayland) — OnePlus 6 (sdm845)
+       桌面 Linux —— 由合成器快捷键驱动（niri/sway…），见 DESKTOP.md
 识别 : 豆包语音「录音文件识别」大模型  volc.seedasr.auc  (0.8 元/小时)
-注入 : /dev/uinput 虚拟键盘 + wl-copy 剪贴板
-       —— 不用 wtype：剪贴板走 UTF-8，中文/emoji 天然安全
+注入 : 两种方案，由配置 injector 选择
+       uinput = /dev/uinput 虚拟键盘（手机默认，需要 root/udev 授权）
+       wtype  = zwp_virtual_keyboard（桌面推荐，无需 root）
+       两者都配合 wl-copy 剪贴板 —— 剪贴板走 UTF-8，中文/emoji 天然安全
 
 设计 : 默认【不 grab】音量键，只是被动读取。
        evdev 允许多个读者，所以不影响你已有的
@@ -20,8 +23,20 @@ VoiceType — 长按音量键说话，松手自动上屏
   长按音量上键 (>=enter_hold_ms)  注入一次回车 (Enter)
   短按音量上键               忽略（音量正常调节）
 
+桌面模式（--serve）：不读 evdev、不平铺键盘，只监听 Unix socket，
+由合成器快捷键调用 --toggle / --start / --stop：
+
+  Mod+V 按下   -> voicetype --toggle  -> 开始录音（弹通知）
+  Mod+V 再按   -> voicetype --toggle  -> 停止 -> 识别 -> Ctrl+V 上屏
+  （可选）说话后静音 silence_ms 毫秒自动停止，连第二次按键都省了
+
 用法 :
-  voicetype                启动守护进程
+  voicetype                启动守护进程（手机：长按音量键）
+  voicetype --serve        启动桌面守护进程（socket 控制）
+  voicetype --toggle       开始/停止录音（给快捷键用）
+  voicetype --start/--stop 只开始 / 只停止
+  voicetype --status       查询状态
+  voicetype --enter        注入一次回车
   voicetype --record N     手动录 N 秒并粘贴（调试）
   voicetype --devices      列出输入设备
   voicetype --check        自检
@@ -33,12 +48,16 @@ import io
 import json
 import time
 import glob
+import math
+import array
 import shutil
+import socket
 import base64
 import wave
 import uuid
 import signal
 import select
+import threading
 import traceback
 import subprocess
 import urllib.request
@@ -91,6 +110,14 @@ DEFAULT_CONFIG = {
     "suspend_reload_idle": 900,
     # 上传前用 OGG OPUS 压缩的码率(kbps)，体积约为 WAV 的 1/8；<=0 则直接传 WAV
     "opus_bitrate": 24,
+    # ── 桌面模式（--serve）──
+    "injector": "uinput",       # uinput | wtype（wtype 无需 root，桌面推荐）
+    "socket_path": "",          # 空 = $XDG_RUNTIME_DIR/voicetype.sock
+    "auto_stop": True,          # 桌面：说过话之后静音超过 silence_ms 自动停止
+    "silence_ms": 1200,
+    "silence_rms": 300,         # 16bit PCM 的 RMS 阈值（>= 视为有声音）
+    "wtype_delay_ms": 30,       # wtype 注入时按住修饰键的时长（有些应用需要）
+    "heal_mic": False,          # 采集失效时重启 PulseAudio（手机需要，桌面默认关）
 }
 
 
@@ -180,31 +207,111 @@ def recorder_cmd(cfg):
     return cmd
 
 
-def rec_start(cfg):
-    f = open(RAW_PATH, "wb")
-    p = subprocess.Popen(recorder_cmd(cfg), stdout=f,
-                         stderr=subprocess.DEVNULL, env=ENV or session_env())
-    return p, f
+def pcm_rms(data):
+    """16bit PCM 的均方根 —— 用来粗判「有没有人在说话」。"""
+    n = len(data) - (len(data) % 2)
+    if n <= 0:
+        return 0.0
+    a = array.array("h")
+    a.frombytes(data[:n])
+    total = 0
+    for v in a:
+        total += v * v
+    return math.sqrt(total / len(a))
 
 
-def rec_stop(p, f):
-    """SIGINT 让 parec 把缓冲区刷干净"""
-    try:
-        p.send_signal(signal.SIGINT)
-        p.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        p.kill(); p.wait()
-    except Exception:
-        pass
-    try:
-        f.close()
-    except Exception:
-        pass
-    try:
-        with open(RAW_PATH, "rb") as fp:
-            return fp.read()
-    except Exception:
-        return b""
+class Recorder:
+    """流式录音：后台线程读 parec，一边落盘一边算电平。
+
+    这样桌面模式就能在「说过话之后静音」时自动收尾（连第二次按键都省了）。
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.buf = bytearray()
+        self.lock = threading.Lock()
+        self.p = None
+        self.f = None
+        self.thread = None
+        self.done = threading.Event()
+        self.voiced = False
+        self.started = time.time()
+        self.last_voice = self.started
+        self.chunk = max(1, int(cfg["rate"] * 2 * cfg["channels"] * 0.1))  # 100ms
+
+    def start(self):
+        self.f = open(RAW_PATH, "wb")
+        self.p = subprocess.Popen(recorder_cmd(self.cfg), stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, env=ENV or session_env())
+        self.started = time.time()
+        self.last_voice = self.started
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+        return self
+
+    def _loop(self):
+        threshold = float(self.cfg.get("silence_rms", 300) or 0)
+        while True:
+            d = self.p.stdout.read(self.chunk)
+            if not d:
+                break
+            with self.lock:
+                self.buf += d
+            try:
+                self.f.write(d)
+                self.f.flush()
+            except Exception:
+                pass
+            if threshold > 0 and pcm_rms(d) >= threshold:
+                self.voiced = True
+                self.last_voice = time.time()
+        self.done.set()
+
+    def seconds(self):
+        with self.lock:
+            return len(self.buf) / float(self.cfg["rate"] * 2 * self.cfg["channels"])
+
+    def silent_ms(self):
+        return (time.time() - self.last_voice) * 1000.0
+
+    def stop(self):
+        """SIGINT 让 parec 把缓冲区刷干净，然后返回全部 PCM"""
+        try:
+            self.p.send_signal(signal.SIGINT)
+            self.p.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.p.kill(); self.p.wait()
+        except Exception:
+            pass
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+        try:
+            self.f.close()
+        except Exception:
+            pass
+        try:
+            self.p.stdout.close()
+        except Exception:
+            pass
+        with self.lock:
+            raw = bytes(self.buf)
+        if not raw:
+            try:
+                with open(RAW_PATH, "rb") as fp:
+                    raw = fp.read()
+            except Exception:
+                raw = b""
+        return raw
+
+    def auto_stop_ready(self):
+        """True = 该自动收尾了（说过话 + 静音够久 + 已录够长度）"""
+        cfg = self.cfg
+        if not cfg.get("auto_stop", True):
+            return False
+        if not self.voiced:
+            return False
+        wait = float(cfg.get("silence_ms", 1200) or 0)
+        return self.silent_ms() >= wait and self.seconds() >= 0.8
 
 
 def pcm_to_wav(raw, cfg):
@@ -363,54 +470,150 @@ def clipboard_read():
         return None
 
 
-def make_uinput(e, cfg):
-    keys = set()
-    for group in ("paste_mods", "paste_mods_terminal"):
-        for m in (cfg.get(group) or []):
-            keys.add(getattr(e, "KEY_" + m))
-    keys.add(getattr(e, "KEY_" + cfg["paste_key"]))
-    keys.add(e.KEY_VOLUMEUP)
-    keys.add(e.KEY_VOLUMEDOWN)
-    keys.add(e.KEY_ENTER)
-    from evdev import UInput
-    ui = UInput({e.EV_KEY: sorted(keys)},
-                name="voicetype-vkbd", bustype=e.BUS_USB)
-    time.sleep(0.35)          # 等合成器识别到新设备
-    return ui
+_WTYPE_MODS = {"LEFTCTRL": "ctrl", "RIGHTCTRL": "ctrl",
+               "LEFTSHIFT": "shift", "RIGHTSHIFT": "shift",
+               "LEFTALT": "alt", "RIGHTALT": "alt",
+               "LEFTMETA": "logo", "RIGHTMETA": "logo"}
 
 
-def inject_paste(ui, e, cfg, mods=None):
-    if mods is None:
-        mods = cfg["paste_mods"]
-    mods = [getattr(e, "KEY_" + m) for m in mods]
-    key = getattr(e, "KEY_" + cfg["paste_key"])
-    for m in mods:
-        ui.write(e.EV_KEY, m, 1)
-    ui.syn()
-    ui.write(e.EV_KEY, key, 1)
-    ui.syn()
-    time.sleep(0.02)
-    ui.write(e.EV_KEY, key, 0)
-    ui.syn()
-    for m in reversed(mods):
-        ui.write(e.EV_KEY, m, 0)
-    ui.syn()
+class Injector:
+    """把按键组合送进当前焦点窗口（剪贴板已经在前面写好了）"""
+
+    def paste(self, mods):
+        raise NotImplementedError
+
+    def enter(self):
+        raise NotImplementedError
+
+    def forward(self, code, value):
+        """只有 uinput 独占模式需要：把非触发键透传回系统"""
+
+    def close(self):
+        pass
 
 
-def inject_enter(ui, e):
-    """注入一次回车键 (tap Enter)"""
-    ui.write(e.EV_KEY, e.KEY_ENTER, 1)
-    ui.syn()
-    time.sleep(0.02)
-    ui.write(e.EV_KEY, e.KEY_ENTER, 0)
-    ui.syn()
+class UinputInjector(Injector):
+    """虚拟键盘（/dev/uinput）—— 手机默认；需要 root 或 udev 授权"""
+
+    def __init__(self, cfg):
+        from evdev import ecodes as e, UInput
+        self.cfg = cfg
+        self.e = e
+        keys = {e.KEY_ENTER, e.KEY_VOLUMEUP, e.KEY_VOLUMEDOWN}
+        for group in ("paste_mods", "paste_mods_terminal"):
+            for m in (cfg.get(group) or []):
+                keys.add(getattr(e, "KEY_" + m))
+        keys.add(getattr(e, "KEY_" + cfg["paste_key"]))
+        self.ui = UInput({e.EV_KEY: sorted(keys)},
+                         name="voicetype-vkbd", bustype=e.BUS_USB)
+        time.sleep(0.35)          # 等合成器识别到新设备
+
+    def paste(self, mods):
+        e, ui = self.e, self.ui
+        mods = [getattr(e, "KEY_" + m) for m in mods]
+        key = getattr(e, "KEY_" + self.cfg["paste_key"])
+        for m in mods:
+            ui.write(e.EV_KEY, m, 1)
+        ui.syn()
+        ui.write(e.EV_KEY, key, 1)
+        ui.syn()
+        time.sleep(0.02)
+        ui.write(e.EV_KEY, key, 0)
+        ui.syn()
+        for m in reversed(mods):
+            ui.write(e.EV_KEY, m, 0)
+        ui.syn()
+
+    def enter(self):
+        """注入一次回车键 (tap Enter)"""
+        e, ui = self.e, self.ui
+        ui.write(e.EV_KEY, e.KEY_ENTER, 1)
+        ui.syn()
+        time.sleep(0.02)
+        ui.write(e.EV_KEY, e.KEY_ENTER, 0)
+        ui.syn()
+
+    def forward(self, code, value):
+        self.ui.write(self.e.EV_KEY, code, value)
+        self.ui.syn()
+
+    def close(self):
+        try:
+            self.ui.close()
+        except Exception:
+            pass
+
+
+class WtypeInjector(Injector):
+    """zwp_virtual_keyboard（wtype）—— 桌面推荐，无需 root/udev。
+    只用来敲组合键；文本走剪贴板，所以中文/emoji 不受影响。"""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def _run(self, args):
+        try:
+            r = subprocess.run(["wtype"] + args, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               env=ENV or session_env(), timeout=10)
+            if r.returncode != 0:
+                log("wtype rc=%s err=%s" % (r.returncode,
+                                            r.stderr.decode(errors="replace").strip()[:160]))
+            return r.returncode == 0
+        except FileNotFoundError:
+            log("❌ 没装 wtype（pacman -S wtype）")
+            return False
+        except Exception as ex:
+            log("wtype 异常: %s" % ex)
+            return False
+
+    def paste(self, mods):
+        delay = float(self.cfg.get("wtype_delay_ms", 30) or 0) / 1000.0
+        args = []
+        for m in mods:
+            args += ["-M", _WTYPE_MODS.get(m.upper(), "ctrl")]
+            if delay > 0:
+                args += ["-s", "%g" % delay]
+        args += ["-k", self.cfg["paste_key"].lower()]
+        for m in reversed(mods):
+            args += ["-m", _WTYPE_MODS.get(m.upper(), "ctrl")]
+        return self._run(args)
+
+    def enter(self):
+        return self._run(["-k", "Return"])
+
+
+def make_injector(cfg):
+    kind = (cfg.get("injector") or "uinput").lower()
+    if kind == "wtype":
+        return WtypeInjector(cfg)
+    if kind == "uinput":
+        return UinputInjector(cfg)
+    raise SystemExit("❌ 未知 injector: %s（可选 uinput / wtype）" % kind)
 
 
 # ─────────────────── 焦点应用检测 ───────────────────
 def focused_app(cfg):
-    """用 wt-focus 查当前获得键盘焦点的顶层窗口 app_id。
-    失败返回 None（上层会退回默认粘贴组合键）。"""
+    """查当前获得键盘焦点的顶层窗口 app_id，失败返回 None
+    （上层会退回默认粘贴组合键）。
+
+    focus_helper:
+      niri = 用 `niri msg --json focused-window`（桌面推荐，无需额外小工具）
+      其它  = 当作可执行文件名调用，取其 stdout（手机上的 wt-focus）
+    """
     helper = cfg.get("focus_helper") or "wt-focus"
+    env = ENV or session_env()
+    if helper in ("niri", "niri-msg"):
+        try:
+            p = subprocess.run(["niri", "msg", "--json", "focused-window"],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, env=env, timeout=3)
+            if p.returncode == 0:
+                win = json.loads(p.stdout.decode(errors="replace")) or {}
+                return win.get("app_id") or None
+        except Exception as ex:
+            log("niri focused-window 失败: %s" % ex)
+        return None
     path = shutil.which(helper) or os.path.expanduser("~/.local/bin/" + helper)
     if not os.path.exists(path):
         return None
@@ -479,21 +682,26 @@ def heal_mic(cfg):
 
 
 # ─────────────────────── 录→识→贴 主流程 ───────────────────────
-def do_transcribe_and_paste(cfg, ui, e, raw):
+def do_transcribe_and_paste(cfg, inj, raw, secs=None):
     global _last_activity
     _last_activity = time.time()
-    secs = len(raw) / float(cfg["rate"] * 2 * cfg["channels"])
+    if secs is None:
+        secs = len(raw) / float(cfg["rate"] * 2 * cfg["channels"])
     if secs < cfg.get("min_seconds", 0.4):
         log("录音过短 (%.2fs)，忽略" % secs)
-        notify("录音太短", "长按音量下键多说一会儿", icon="dialog-warning", timeout=2500)
+        notify("录音太短", "多说一会儿再松手", icon="dialog-warning", timeout=2500)
         return
 
-    # 纯静音（全 0）= 麦克风采集路径失效（suspend→resume 坏）→ 自愈后提示重说
+    # 纯静音（全 0）= 采集路径失效（手机的 suspend→resume 坏）→ 自愈后提示重说
     if raw and raw.count(0) == len(raw):
-        log("检测到纯静音（麦克风采集失效），执行自愈")
-        heal_mic(cfg)
-        notify("麦克风已修复", "刚才没录到声音，请再说一次",
-               icon="microphone", timeout=5000, urgency="critical")
+        log("检测到纯静音（采集路径失效）")
+        if cfg.get("heal_mic", False):
+            heal_mic(cfg)
+            notify("麦克风已修复", "刚才没录到声音，请再说一次",
+                   icon="microphone", timeout=5000, urgency="critical")
+        else:
+            notify("没录到声音", "麦克风采集是纯静音，检查一下输入设备",
+                   icon="dialog-warning", timeout=4000, urgency="critical")
         return
 
     notify("识别中…", "%.1f 秒音频" % secs, icon="emblem-synchronizing", timeout=0)
@@ -538,7 +746,7 @@ def do_transcribe_and_paste(cfg, ui, e, raw):
         log("焦点应用 '%s' -> %s" % (app or "未知", "+".join(mods)))
 
     time.sleep(0.2)          # 等剪贴板所有权生效
-    inject_paste(ui, e, cfg, mods)
+    inj.paste(mods)
     notify("已上屏", res[:60] + ("…" if len(res) > 60 else ""),
            icon="emblem-ok-symbolic", timeout=2500)
 
@@ -570,8 +778,9 @@ def run_daemon(cfg):
         return 1
     log("触发设备: %s (%s)" % (dev.name, dev.path))
 
-    ui = make_uinput(e, cfg)
-    log("uinput 虚拟键盘: %s" % ui.device.path)
+    inj = make_injector(cfg)
+    log("注入方式: %s" % ("uinput 虚拟键盘 %s" % inj.ui.device.path
+                          if isinstance(inj, UinputInjector) else "wtype"))
 
     grab = bool(cfg.get("grab", False))
     if grab:
@@ -606,10 +815,7 @@ def run_daemon(cfg):
             dev.ungrab()
         except Exception:
             pass
-        try:
-            ui.close()
-        except Exception:
-            pass
+        inj.close()
         sys.exit(0)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -635,8 +841,7 @@ def run_daemon(cfg):
 
                 # 独占模式下，非触发键要转发回系统（否则音量键失灵）
                 if grab and ev.code not in handled_keys:
-                    ui.write(e.EV_KEY, ev.code, ev.value)
-                    ui.syn()
+                    inj.forward(ev.code, ev.value)
                     continue
 
                 # ── 长按音量上 = 回车 ──
@@ -652,9 +857,9 @@ def run_daemon(cfg):
                             if not enter_fired:
                                 log("短按音量上 %.0fms -> 忽略（音量正常调节）" % held)
                                 if grab:
-                                    ui.write(e.EV_KEY, ENTER_KEY, 1); ui.syn()
+                                    inj.forward(ENTER_KEY, 1)
                                     time.sleep(0.03)
-                                    ui.write(e.EV_KEY, ENTER_KEY, 0); ui.syn()
+                                    inj.forward(ENTER_KEY, 0)
                             enter_fired = False
                     continue
 
@@ -667,24 +872,24 @@ def run_daemon(cfg):
 
                 elif ev.value == 0:                     # 松开
                     if rec is not None:
-                        raw = rec_stop(rec[0], rec[1])
+                        raw = rec.stop()
                         rec = None; rec_t = None; press_t = None
-                        do_transcribe_and_paste(cfg, ui, e, raw)
+                        do_transcribe_and_paste(cfg, inj, raw)
                     elif press_t is not None:
                         held = (time.time() - press_t) * 1000
                         press_t = None
                         log("短按 %.0fms -> 忽略（音量正常调节）" % held)
                         if grab:
-                            ui.write(e.EV_KEY, TRIG, 1); ui.syn()
+                            inj.forward(TRIG, 1)
                             time.sleep(0.03)
-                            ui.write(e.EV_KEY, TRIG, 0); ui.syn()
+                            inj.forward(TRIG, 0)
 
             # 长按音量上 -> 回车
             if enter_enabled and enter_press_t is not None and not enter_fired:
                 if time.time() - enter_press_t >= enter_hold:
                     enter_fired = True
                     log("长按音量上 -> 注入回车")
-                    inject_enter(ui, e)
+                    inj.enter()
                     notify("回车", "已发送 Enter", icon="emblem-ok-symbolic",
                            timeout=2000)
 
@@ -694,15 +899,15 @@ def run_daemon(cfg):
                     log("长按触发 -> 开始录音")
                     notify("录音中…", "松开按钮结束", icon="microphone",
                            timeout=0, urgency="critical")
-                    rec = rec_start(cfg)
+                    rec = Recorder(cfg).start()
                     rec_t = time.time()
 
             # 超长自动收尾
             if rec is not None and rec_t is not None and time.time() - rec_t >= maxsec:
                 log("达到上限 %ds，自动结束" % maxsec)
-                raw = rec_stop(rec[0], rec[1])
+                raw = rec.stop()
                 rec = None; rec_t = None; press_t = None
-                do_transcribe_and_paste(cfg, ui, e, raw)
+                do_transcribe_and_paste(cfg, inj, raw)
 
             # 自愈后空闲过久 → 把 suspend-on-idle 装回去，恢复省电
             idle_reload = float(cfg.get("suspend_reload_idle", 900) or 0)
@@ -713,8 +918,217 @@ def run_daemon(cfg):
             dev.ungrab()
         except Exception:
             pass
+        inj.close()
+
+
+# ─────────────────── 桌面模式：socket 服务 + 客户端 ───────────────────
+def socket_path(cfg):
+    p = (cfg.get("socket_path") or "").strip()
+    if p:
+        return os.path.expanduser(p)
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    return os.path.join(runtime, "voicetype.sock")
+
+
+class Server:
+    """桌面守护进程：不碰 evdev，只等合成器快捷键通过 socket 下命令。
+
+    命令: toggle / start / stop / enter / status / quit
+    （toggle 可被连续调用，也支持「说完静音自动收尾」）
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.rec = None
+        self.inj = None
+        self.path = socket_path(cfg)
+        self.srv = None
+        self.quit = False
+
+    # ── 状态 / 动作 ──
+    def state(self):
+        return "recording" if self.rec is not None else "idle"
+
+    def start_rec(self):
+        if self.rec is not None:
+            return False, "已经在录音了"
+        if not self.cfg.get("api_key"):
+            log("❌ 未配置 api_key，不能录音")
+            notify("VoiceType 未配置", "请先在 ~/.config/voicetype/config.json 填 api_key",
+                   icon="dialog-error", timeout=4000, urgency="critical")
+            return False, "未配置 api_key"
+        self.rec = Recorder(self.cfg).start()
+        log("桌面：开始录音")
+        notify("录音中…", "再按一次快捷键结束（停嘴稍等也会自动收尾）",
+               icon="microphone", timeout=0, urgency="critical")
+        return True, "recording"
+
+    def stop_rec(self):
+        if self.rec is None:
+            return False, "没在录音"
+        rec, self.rec = self.rec, None
         try:
-            ui.close()
+            raw = rec.stop()
+            secs = rec.seconds()
+            log("桌面：停止录音 (%.1fs, %d 字节)" % (secs, len(raw)))
+            do_transcribe_and_paste(self.cfg, self.inj, raw, secs)
+        except Exception:
+            log("💥 收尾失败:\n" + traceback.format_exc())
+            notify("识别出错", "看 /tmp/voicetype.log", icon="dialog-error", timeout=4000)
+        return True, "ok"
+
+    def toggle(self):
+        return self.stop_rec() if self.rec is not None else self.start_rec()
+
+    def dispatch(self, cmd):
+        if cmd == "toggle":
+            return self.toggle()
+        if cmd == "start":
+            return self.start_rec()
+        if cmd == "stop":
+            return self.stop_rec()
+        if cmd == "enter":
+            self.inj.enter()
+            notify("回车", "已发送 Enter", icon="emblem-ok-symbolic", timeout=2000)
+            return True, "ok"
+        if cmd == "status":
+            return True, self.state()
+        if cmd in ("quit", "exit"):
+            self.quit = True
+            return True, "bye"
+        return False, "未知命令: %s" % cmd
+
+    # ── 主循环 ──
+    def tick(self):
+        """没命令时也要跑的周期检查：静音自动收尾 / 超长收尾"""
+        if self.rec is None:
+            return
+        if self.rec.auto_stop_ready():
+            log("桌面：说话后静音 %.0fms，自动收尾" % self.rec.silent_ms())
+            self.stop_rec()
+        elif self.rec.seconds() >= float(self.cfg.get("max_seconds", 120) or 120):
+            log("桌面：达到上限 %ss，自动收尾" % self.cfg.get("max_seconds"))
+            self.stop_rec()
+
+    def handle(self, conn):
+        data = b""
+        try:
+            conn.settimeout(3)
+            while b"\n" not in data and len(data) < 256:
+                d = conn.recv(256)
+                if not d:
+                    break
+                data += d
+        except Exception:
+            pass
+        cmd = data.decode(errors="replace").strip().split("\n")[0].strip().lower()
+        ok, msg = self.dispatch(cmd)
+        try:
+            conn.sendall((json.dumps({"ok": ok, "state": self.state(), "msg": msg}) + "\n")
+                         .encode())
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def run(self):
+        self.inj = make_injector(self.cfg)
+        if os.path.exists(self.path):
+            try:
+                os.unlink(self.path)
+            except Exception:
+                pass
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(self.path)
+        os.chmod(self.path, 0o600)
+        self.srv.listen(8)
+        self.srv.settimeout(0.2)
+        log("桌面模式就绪：socket %s（injector=%s）"
+            % (self.path, self.cfg.get("injector", "uinput")))
+        if not self.cfg.get("api_key"):
+            log("❌ 还没配 api_key —— 服务照常跑，但录音会拒绝，先去填配置")
+            notify("VoiceType 未配置", "先在 ~/.config/voicetype/config.json 填 api_key",
+                   icon="dialog-error", timeout=0, urgency="critical")
+        else:
+            notify("VoiceType 已就绪", "按快捷键开始/结束语音输入",
+                   icon="microphone", timeout=2500)
+        try:
+            while not self.quit:
+                try:
+                    conn, _ = self.srv.accept()
+                except socket.timeout:
+                    self.tick()
+                    continue
+                except Exception as ex:
+                    log("accept 失败: %s" % ex)
+                    time.sleep(0.2)
+                    continue
+                try:
+                    self.handle(conn)
+                except Exception:
+                    log("💥 处理命令失败:\n" + traceback.format_exc())
+        finally:
+            if self.rec is not None:
+                try:
+                    self.rec.stop()
+                except Exception:
+                    pass
+            self.inj.close()
+            try:
+                self.srv.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(self.path)
+            except Exception:
+                pass
+            log("桌面模式退出")
+        return 0
+
+
+def ctl(cfg, cmd, timeout=180.0):
+    """客户端：把命令发给守护进程。没运行则顺手拉起 systemd 用户服务。"""
+    path = socket_path(cfg)
+    sock = None
+    for attempt in (0, 1):
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect(path)
+            break
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            sock = None
+            if attempt == 0:
+                log("守护进程没在跑，尝试拉起 voicetype.service")
+                try:
+                    subprocess.run(["systemctl", "--user", "start", "voicetype.service"],
+                                   env=ENV or session_env(), timeout=15,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception as ex:
+                    log("拉起服务失败: %s" % ex)
+                time.sleep(1.5)
+                continue
+            log("❌ 连不上守护进程 (%s)" % path)
+            notify("语音输入不可用", "守护进程没在跑：systemctl --user start voicetype",
+                   icon="dialog-error", timeout=4000)
+            return 1
+    try:
+        sock.sendall((cmd + "\n").encode())
+        data = sock.recv(4096).decode(errors="replace").strip()
+        log("ctl %s -> %s" % (cmd, data))
+        return 0
+    except Exception as ex:
+        log("ctl %s 失败: %s" % (cmd, ex))
+        return 1
+    finally:
+        try:
+            sock.close()
         except Exception:
             pass
 
@@ -735,63 +1149,93 @@ def cmd_devices():
 
 
 def cmd_record(cfg, secs):
-    from evdev import ecodes as e
     log("手动录音 %.1f 秒…" % secs)
-    ui = make_uinput(e, cfg)
-    p, f = rec_start(cfg)
+    inj = make_injector(cfg)
+    rec = Recorder(cfg).start()
     time.sleep(secs)
-    raw = rec_stop(p, f)
+    raw = rec.stop()
     log("采集 %d 字节" % len(raw))
-    do_transcribe_and_paste(cfg, ui, e, raw)
-    ui.close()
+    do_transcribe_and_paste(cfg, inj, raw)
+    inj.close()
     return 0
 
 
 def cmd_check(cfg):
     ok = True
+    kind = (cfg.get("injector") or "uinput").lower()
     print("── 配置 ──")
     print("  config      : %s %s" % (CONFIG_FILE, "✅" if CONFIG_FILE.exists() else "❌"))
     print("  api_key     : %s" % ("✅ 已设置 (%s…)" % cfg["api_key"][:8] if cfg["api_key"] else "❌ 未设置"))
     print("  resource_id : %s" % cfg["resource_id"])
-    print("  trigger     : 长按 %s >= %dms  (grab=%s)" % (cfg["trigger_key"], cfg["hold_ms"], cfg.get("grab")))
+    print("  injector    : %s" % kind)
+    print("  触发        : 长按 %s >= %dms  (grab=%s)" % (cfg["trigger_key"], cfg["hold_ms"], cfg.get("grab")))
+    print("  录音        : %dHz %dch  max %ss  自动收尾=%s(静音 %sms)" % (
+        cfg["rate"], cfg["channels"], cfg.get("max_seconds"),
+        "开" if cfg.get("auto_stop", True) else "关", cfg.get("silence_ms")))
     print("  enter       : 长按 %s >= %dms -> 回车 (%s)" % (
         cfg.get("enter_key", "KEY_VOLUMEUP"),
         cfg.get("enter_hold_ms", cfg["hold_ms"]),
         "开" if cfg.get("enter_enabled", True) else "关"))
-    print("  paste       : %s + %s" % ("+".join(cfg["paste_mods"]), cfg["paste_key"]))
+    print("  paste       : %s + %s" % ("+".join(cfg["paste_mods"]) or "Ctrl", cfg["paste_key"]))
+    print("  socket      : %s" % socket_path(cfg))
 
     print("── 依赖 ──")
+    need_evdev = (kind == "uinput")
     try:
         import evdev  # noqa
         print("  python-evdev : ✅")
     except ImportError:
-        print("  python-evdev : ❌"); ok = False
-    for b in ("parec", "wl-copy", "notify-send"):
+        print("  python-evdev : %s" % ("❌" if need_evdev else "– 不需要（injector=wtype）"))
+        if need_evdev:
+            ok = False
+    bins = ["parec", "wl-copy", "notify-send"] + (["wtype"] if kind == "wtype" else [])
+    for b in bins:
         rc = subprocess.run(["which", b], capture_output=True).returncode
         print("  %-12s : %s" % (b, "✅" if rc == 0 else "❌"))
         if rc != 0:
             ok = False
+    if not shutil.which("opusenc"):
+        print("  %-12s : ⚠️ 未装（将直接传 WAV）" % "opusenc")
 
-    print("── 设备 ──")
-    d = find_device(cfg["trigger_device"])
-    print("  触发设备     : %s" % (("%s (%s) ✅" % (d.name, d.path)) if d else "❌ " + cfg["trigger_device"]))
-    if not d:
-        ok = False
-    print("  /dev/uinput  : %s" % ("✅ 可写" if os.access("/dev/uinput", os.W_OK) else "❌ 不可写"))
+    if need_evdev:
+        print("── 设备 ──")
+        d = find_device(cfg["trigger_device"])
+        print("  触发设备     : %s" % (("%s (%s) ✅" % (d.name, d.path)) if d else "❌ " + cfg["trigger_device"]))
+        if not d:
+            ok = False
+        print("  /dev/uinput  : %s" % ("✅ 可写" if os.access("/dev/uinput", os.W_OK) else "❌ 不可写"))
 
     print("── 会话 ──")
     env = session_env()
     for k in _SESSION_KEYS:
         print("  %-24s: %s" % (k, env.get(k, "❌ 缺失")))
 
+    print("── 守护进程 ──")
+    if kind == "wtype":
+        sp = socket_path(cfg)
+        live = False
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect(sp)
+            s.sendall(b"status\n")
+            live = b"idle" in s.recv(256) or b"recording" in s.recv(256)
+            s.close()
+        except Exception:
+            live = False
+        print("  socket 可连  : %s" % ("✅ 守护进程在跑" if live else "⚠️ 没在跑（systemctl --user start voicetype）"))
+
     print("── 剪贴板 ──")
     print("  wl-copy 写入 : %s" % ("✅" if set_clipboard("voicetype-check") else "❌"))
 
     print("── 焦点检测 ──")
     helper = cfg.get("focus_helper") or "wt-focus"
-    hp = shutil.which(helper) or os.path.expanduser("~/.local/bin/" + helper)
-    print("  %-12s : %s" % (helper, ("✅ " + hp) if os.path.exists(hp)
-                                 else "⚠️ 未找到（将固定用 Ctrl+V）"))
+    if helper in ("niri", "niri-msg"):
+        print("  %-12s : %s" % (helper, "✅ 内置（niri msg）" if shutil.which("niri") else "❌ 没找到 niri"))
+    else:
+        hp = shutil.which(helper) or os.path.expanduser("~/.local/bin/" + helper)
+        print("  %-12s : %s" % (helper, ("✅ " + hp) if os.path.exists(hp)
+                                     else "⚠️ 未找到（将固定用 Ctrl+V）"))
     fa = focused_app(cfg)
     print("  当前焦点应用 : %s" % (fa if fa else "（查不到）"))
     terms = [t.lower() for t in (cfg.get("terminal_apps") or [])]
@@ -807,7 +1251,13 @@ def cmd_check(cfg):
 
 USAGE = """VoiceType — 长按音量键说话，松手自动上屏
 
-  voicetype                启动守护进程
+  voicetype                启动守护进程（手机：长按音量键）
+  voicetype --serve        启动桌面守护进程（socket 控制，给 niri 快捷键用）
+  voicetype --toggle       开始 / 停止录音
+  voicetype --start        只开始录音
+  voicetype --stop         只停止录音（识别 + 上屏）
+  voicetype --status       打印当前状态
+  voicetype --enter        注入一次回车
   voicetype --record N     手动录 N 秒并粘贴（调试）
   voicetype --devices      列出输入设备
   voicetype --check        自检
@@ -835,6 +1285,10 @@ def main():
                           "api_key": (cfg["api_key"][:8] + "…") if cfg["api_key"] else ""},
                          indent=2, ensure_ascii=False))
         return 0
+    if a == "--serve":
+        return Server(cfg).run()
+    if a in ("--toggle", "--start", "--stop", "--status", "--enter"):
+        return ctl(cfg, a[2:])
     if a == "--record":
         return cmd_record(cfg, float(args[1]) if len(args) > 1 else 5.0)
     print("未知参数: %s\n" % a)

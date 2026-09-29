@@ -4,6 +4,10 @@
 
 在 OnePlus 6（Qualcomm SDM845）+ postmarketOS + Phosh 上开发并日常使用：**长按音量下键说话，松手后自动把识别结果粘贴到当前焦点窗口**。
 
+> 想在**桌面 Linux（Arch + niri 等 wlroots 系合成器）**上用快捷键语音输入？
+> 见 **[DESKTOP.md](DESKTOP.md)** —— 同一份程序多一个 `--serve` 模式，
+> 不需要 root/evdev/uinput，文字仍走剪贴板 + 虚拟键盘上屏。
+
 ## 特性
 
 - 🎤 **长按音量下键** → 录音；松开 → 语音识别 → 自动上屏

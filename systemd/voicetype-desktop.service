@@ -1,0 +1,14 @@
+[Unit]
+Description=VoiceType — 桌面快捷键语音输入（socket 模式，由合成器快捷键驱动）
+Documentation=file:%h/AIworks/01-技术研究/2026-09-29_语音输入voicetype/DESKTOP.md
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/voicetype --serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
