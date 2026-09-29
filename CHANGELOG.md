@@ -31,6 +31,14 @@
   udev 只给 `ID_INPUT=1` 而拿不到 `ID_INPUT_KEYBOARD=1`，libinput 会把按键**静默丢弃**
 - **`wtype -s` 收整数毫秒**（`atoi` 解析），传 `0.03` 会被当 0 报错
 
+### 🔔 通知图标
+
+- 图标名可配置：`config.json` 的 `icons`（`mic` / `busy` / `ok` / `warn` / `error`），
+  取值是 Freedesktop 图标名或绝对路径；默认 `audio-input-microphone`、`emblem-synchronizing`、
+  `emblem-default`、`dialog-warning`、`dialog-error`
+- 顺带修掉三个**在 Adwaita 主题下根本不存在**的图标名（`emblem-ok-symbolic`、`dialog-warning`、
+  `dialog-error`），以前这些通知会没有图标
+
 ### 📄 文档
 
 - `NOTES.md`：移植前后的对照、为什么放弃 wtype、`uaccess` 规则顺序、

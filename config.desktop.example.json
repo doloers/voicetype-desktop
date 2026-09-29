@@ -40,5 +40,12 @@
   "wtype_delay_ms": 30,
   "heal_mic": false,
   "suspend_reload_idle": 0,
-  "mode": "desktop"
+  "mode": "desktop",
+  "icons": {
+    "mic": "audio-input-microphone",
+    "busy": "emblem-synchronizing",
+    "ok": "emblem-default",
+    "warn": "dialog-warning",
+    "error": "dialog-error"
+  }
 }

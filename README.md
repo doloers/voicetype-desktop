@@ -132,6 +132,7 @@ journalctl --user -u voicetype-desktop -f      # 或 tail -f /tmp/voicetype.log
 | `terminal_apps` | `foot, alacritty, kitty, …` | 判定为终端的 app_id 列表 |
 | `opus_bitrate` | `24` | OPUS 码率（kbps），`0` = 直接传 WAV |
 | `notify` / `save_history` | `true` | 桌面通知 / 保存识别历史 |
+| `icons` | `mic: audio-input-microphone`、`busy: emblem-synchronizing`、`ok: emblem-default`、`warn: dialog-warning`、`error: dialog-error` | 通知图标：值是 Freedesktop 图标名，也可以是**绝对路径**（想用某个具体 png/svg 就填路径） |
 | `mode` | `desktop` | 只影响 `--check` 的提示（桌面上不要求音量键设备存在） |
 | `injector_retries` | `10` | 启动时注入器初始化重试次数（每次间隔 3s，防开机时 `/dev/uinput` 未就绪） |
 
@@ -147,6 +148,7 @@ journalctl --user -u voicetype-desktop -f      # 或 tail -f /tmp/voicetype.log
 | 识别成功但没上屏 | `voicetype --check` 看 `/dev/uinput` 是否可写（跑 `setup-uinput-desktop.sh`） |
 | 重启后按键没反应 | `systemctl --user status voicetype-desktop`；`ls -l /dev/uinput` 属主是否是你；`lsmod \| grep uinput` |
 | 提前自动收尾（还没说就停） | 环境噪声大：把 `silence_rms` 调高 或 `voice_chunks` 调大 |
+| 通知没图标 / 图标空白 | 图标名在你的图标主题里不存在。给 dunst 的 `icon_path` 加上实际目录（如 `/usr/share/icons/AdwaitaLegacy/48x48/legacy/`、`.../devices/`、`.../emblems/`），或直接在 `icons` 里写绝对路径 |
 | API 报 `45000010` / `45000030` | Key 无效 / 能力未开通（豆包控制台「开通管理」） |
 
 更多实测细节（为什么不用 wtype、`ID_INPUT_KEYBOARD` 标签、`uaccess` 规则顺序、`parec` 缓冲）

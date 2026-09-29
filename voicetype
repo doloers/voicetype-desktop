@@ -126,6 +126,18 @@ DEFAULT_CONFIG = {
 }
 
 
+# ─────────────────────── 通知图标 ───────────────────────
+# 通知里用的图标名（Freedesktop 图标命名，也可以是绝对路径）。
+# 想换图标不用改代码：在 config.json 里写 "icons": {"mic": "...", ...} 覆盖即可。
+DEFAULT_ICONS = {
+    "mic":   "audio-input-microphone",   # 录音中 / 麦克风相关
+    "busy":  "emblem-synchronizing",     # 识别中
+    "ok":    "emblem-default",           # 已上屏 / 回车
+    "warn":  "dialog-warning",           # 录音太短 / 没录到声音
+    "error": "dialog-error",             # 识别失败 / 未配置
+}
+
+
 # ─────────────────────────── 日志 ───────────────────────────
 def log(msg):
     line = "%s  %s" % (datetime.now().strftime("%H:%M:%S"), msg)
@@ -187,13 +199,18 @@ def load_config():
 
 
 # ───────────────────────── 通知 ─────────────────────────
-def notify(title, body="", icon="microphone", timeout=0, urgency="normal"):
-    if not load_config().get("notify", True):
+def notify(title, body="", icon="mic", timeout=0, urgency="normal"):
+    """icon 可以是 DEFAULT_ICONS 的键（mic/busy/ok/warn/error），也可以是图标名或绝对路径"""
+    cfg = load_config()
+    if not cfg.get("notify", True):
         return
+    icons = dict(DEFAULT_ICONS)
+    icons.update(cfg.get("icons") or {})
+    icon = icons.get(icon, icon)
     try:
         cmd = ["notify-send",
                "-h", "string:x-canonical-private-synchronous:voicetype",
-               "-i", icon, "-u", urgency, "-t", str(timeout), title]
+               "-i", str(icon), "-u", urgency, "-t", str(timeout), title]
         if body:
             cmd.append(body)
         subprocess.Popen(cmd, env=ENV or session_env(),
@@ -734,7 +751,7 @@ def do_transcribe_and_paste(cfg, inj, raw, secs=None):
         secs = len(raw) / float(cfg["rate"] * 2 * cfg["channels"])
     if secs < cfg.get("min_seconds", 0.4):
         log("录音过短 (%.2fs)，忽略" % secs)
-        notify("录音太短", "多说一会儿再松手", icon="dialog-warning", timeout=2500)
+        notify("录音太短", "多说一会儿再松手", icon="warn", timeout=2500)
         return
 
     # 纯静音（全 0）= 采集路径失效（手机的 suspend→resume 坏）→ 自愈后提示重说
@@ -743,13 +760,13 @@ def do_transcribe_and_paste(cfg, inj, raw, secs=None):
         if cfg.get("heal_mic", False):
             heal_mic(cfg)
             notify("麦克风已修复", "刚才没录到声音，请再说一次",
-                   icon="microphone", timeout=5000, urgency="critical")
+                   icon="mic", timeout=5000, urgency="critical")
         else:
             notify("没录到声音", "麦克风采集是纯静音，检查一下输入设备",
-                   icon="dialog-warning", timeout=4000, urgency="critical")
+                   icon="warn", timeout=4000, urgency="critical")
         return
 
-    notify("识别中…", "%.1f 秒音频" % secs, icon="emblem-synchronizing", timeout=0)
+    notify("识别中…", "%.1f 秒音频" % secs, icon="busy", timeout=0)
     audio = pcm_to_opus(raw, cfg)
     if len(raw):
         log("音频压缩: PCM %d → 上传 %d 字节 (%.0f%%)"
@@ -760,7 +777,7 @@ def do_transcribe_and_paste(cfg, inj, raw, secs=None):
 
     if not ok:
         log("识别失败: %s" % res)
-        notify("识别失败", res, icon="dialog-error", timeout=5000, urgency="critical")
+        notify("识别失败", res, icon="error", timeout=5000, urgency="critical")
         return
 
     log("识别成功 (%.2fs): %s" % (dt, res))
@@ -774,7 +791,7 @@ def do_transcribe_and_paste(cfg, inj, raw, secs=None):
             pass
 
     if not set_clipboard(res):
-        notify("已识别，但写剪贴板失败", res[:60], icon="dialog-warning", timeout=5000)
+        notify("已识别，但写剪贴板失败", res[:60], icon="warn", timeout=5000)
         return
 
     got = clipboard_read()
@@ -793,7 +810,7 @@ def do_transcribe_and_paste(cfg, inj, raw, secs=None):
     time.sleep(0.2)          # 等剪贴板所有权生效
     inj.paste(mods)
     notify("已上屏", res[:60] + ("…" if len(res) > 60 else ""),
-           icon="emblem-ok-symbolic", timeout=2500)
+           icon="ok", timeout=2500)
 
 
 # ───────────────────────── 守护进程 ─────────────────────────
@@ -814,7 +831,7 @@ def run_daemon(cfg):
 
     if not cfg.get("api_key"):
         log("❌ 未配置 api_key")
-        notify("VoiceType 未配置", "请先在 config.json 填 api_key", icon="dialog-error")
+        notify("VoiceType 未配置", "请先在 config.json 填 api_key", icon="error")
         return 1
 
     dev = find_device(cfg["trigger_device"])
@@ -872,9 +889,9 @@ def run_daemon(cfg):
             cfg.get("enter_key", "KEY_VOLUMEUP"),
             cfg.get("enter_hold_ms", cfg["hold_ms"])))
         notify("VoiceType 已就绪", "长按音量下说话；长按音量上回车",
-               icon="microphone", timeout=2500)
+               icon="mic", timeout=2500)
     else:
-        notify("VoiceType 已就绪", "长按音量下键说话", icon="microphone", timeout=2500)
+        notify("VoiceType 已就绪", "长按音量下键说话", icon="mic", timeout=2500)
 
     try:
         while True:
@@ -935,14 +952,14 @@ def run_daemon(cfg):
                     enter_fired = True
                     log("长按音量上 -> 注入回车")
                     inj.enter()
-                    notify("回车", "已发送 Enter", icon="emblem-ok-symbolic",
+                    notify("回车", "已发送 Enter", icon="ok",
                            timeout=2000)
 
             # 长按判定
             if press_t is not None and rec is None:
                 if time.time() - press_t >= hold:
                     log("长按触发 -> 开始录音")
-                    notify("录音中…", "松开按钮结束", icon="microphone",
+                    notify("录音中…", "松开按钮结束", icon="mic",
                            timeout=0, urgency="critical")
                     rec = Recorder(cfg).start()
                     rec_t = time.time()
@@ -1001,12 +1018,12 @@ class Server:
         if not self.cfg.get("api_key"):
             log("❌ 未配置 api_key，不能录音")
             notify("VoiceType 未配置", "请先在 ~/.config/voicetype/config.json 填 api_key",
-                   icon="dialog-error", timeout=4000, urgency="critical")
+                   icon="error", timeout=4000, urgency="critical")
             return False, "未配置 api_key"
         self.rec = Recorder(self.cfg).start()
         log("桌面：开始录音")
         notify("录音中…", "再按一次快捷键结束（停嘴稍等也会自动收尾）",
-               icon="microphone", timeout=0, urgency="critical")
+               icon="mic", timeout=0, urgency="critical")
         return True, "recording"
 
     def stop_rec(self):
@@ -1020,7 +1037,7 @@ class Server:
             do_transcribe_and_paste(self.cfg, self.inj, raw, secs)
         except Exception:
             log("💥 收尾失败:\n" + traceback.format_exc())
-            notify("识别出错", "看 /tmp/voicetype.log", icon="dialog-error", timeout=4000)
+            notify("识别出错", "看 /tmp/voicetype.log", icon="error", timeout=4000)
         return True, "ok"
 
     def toggle(self):
@@ -1035,7 +1052,7 @@ class Server:
             return self.stop_rec()
         if cmd == "enter":
             self.inj.enter()
-            notify("回车", "已发送 Enter", icon="emblem-ok-symbolic", timeout=2000)
+            notify("回车", "已发送 Enter", icon="ok", timeout=2000)
             return True, "ok"
         if cmd == "status":
             return True, self.state()
@@ -1109,10 +1126,10 @@ class Server:
         if not self.cfg.get("api_key"):
             log("❌ 还没配 api_key —— 服务照常跑，但录音会拒绝，先去填配置")
             notify("VoiceType 未配置", "先在 ~/.config/voicetype/config.json 填 api_key",
-                   icon="dialog-error", timeout=0, urgency="critical")
+                   icon="error", timeout=0, urgency="critical")
         else:
             notify("VoiceType 已就绪", "按快捷键开始/结束语音输入",
-                   icon="microphone", timeout=2500)
+                   icon="mic", timeout=2500)
         try:
             while not self.quit:
                 try:
@@ -1175,7 +1192,7 @@ def ctl(cfg, cmd, timeout=180.0):
                 continue
             log("❌ 连不上守护进程 (%s)" % path)
             notify("语音输入不可用", "守护进程没在跑：systemctl --user start voicetype",
-                   icon="dialog-error", timeout=4000)
+                   icon="error", timeout=4000)
             return 1
     try:
         sock.sendall((cmd + "\n").encode())
