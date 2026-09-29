@@ -68,7 +68,8 @@ tail -f /tmp/voicetype.log          # 详细日志
 | `api_key` | — | **必填**，豆包语音控制台拿 |
 | `injector` | `wtype` | `wtype`（桌面） / `uinput`（手机） |
 | `focus_helper` | `niri` | 用 `niri msg` 查焦点窗口 app_id |
-| `auto_stop` / `silence_ms` / `silence_rms` | `true` / `1200` / `300` | 说完静音自动收尾；RMS 阈值太小会误判环境噪声，太大说话不停 |
+| `auto_stop` / `silence_ms` / `silence_rms` / `voice_chunks` | `true` / `1200` / `300` / `3` | 说完静音自动收尾；RMS 阈值太小会误判环境噪声，太大说话不停；`voice_chunks` = 连续多少个 100ms 超阈值才算「真在说话」（防按键/通知声误触） |
+| `latency_ms` | `20` | `parec --latency-msec`；**别设 0**（默认会丢开头 ~2 秒） |
 | `max_seconds` | `120` | 单次录音上限 |
 | `wtype_delay_ms` | `30` | 修饰键按住时长，个别应用收到组合键太快会漏 |
 | `heal_mic` | `false` | 桌面关掉 PulseAudio 自愈 |
