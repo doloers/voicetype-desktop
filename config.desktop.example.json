@@ -3,32 +3,42 @@
   "resource_id": "volc.seedasr.auc",
   "endpoint": "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",
   "uid": "x1carbon",
-
-  "injector": "wtype",
+  "injector": "uinput",
   "focus_helper": "niri",
-
   "notify": true,
   "save_history": true,
-
   "auto_stop": true,
   "silence_ms": 1200,
   "silence_rms": 300,
   "max_seconds": 120,
   "min_seconds": 0.4,
   "latency_ms": 20,
-
   "rate": 16000,
   "channels": 1,
   "source": "",
   "opus_bitrate": 24,
-
-  "paste_mods": ["LEFTCTRL"],
-  "paste_mods_terminal": ["LEFTCTRL", "LEFTSHIFT"],
+  "paste_mods": [
+    "LEFTCTRL"
+  ],
+  "paste_mods_terminal": [
+    "LEFTCTRL",
+    "LEFTSHIFT"
+  ],
   "paste_key": "V",
-  "terminal_apps": ["foot", "footclient", "alacritty", "kitty", "wezterm",
-                    "kgx", "gnome-terminal", "ptyxis", "konsole", "xterm"],
+  "terminal_apps": [
+    "foot",
+    "footclient",
+    "alacritty",
+    "kitty",
+    "wezterm",
+    "kgx",
+    "gnome-terminal",
+    "ptyxis",
+    "konsole",
+    "xterm"
+  ],
   "wtype_delay_ms": 30,
-
   "heal_mic": false,
-  "suspend_reload_idle": 0
+  "suspend_reload_idle": 0,
+  "mode": "desktop"
 }

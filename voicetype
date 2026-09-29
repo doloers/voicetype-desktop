@@ -113,7 +113,8 @@ DEFAULT_CONFIG = {
     # 上传前用 OGG OPUS 压缩的码率(kbps)，体积约为 WAV 的 1/8；<=0 则直接传 WAV
     "opus_bitrate": 24,
     # ── 桌面模式（--serve）──
-    "injector": "uinput",       # uinput | wtype（wtype 无需 root，桌面推荐）
+    "mode": "phone",           # phone=读音量键（默认） / desktop=由快捷键驱动（--serve）
+    "injector": "uinput",       # uinput | wtype（wtype 无需 root，但实测 niri 上终端收不到）
     "socket_path": "",          # 空 = $XDG_RUNTIME_DIR/voicetype.sock
     "auto_stop": True,          # 桌面：说过话之后静音超过 silence_ms 自动停止
     "silence_ms": 1200,
@@ -490,6 +491,18 @@ _WTYPE_MODS = {"LEFTCTRL": "ctrl", "RIGHTCTRL": "ctrl",
                "LEFTMETA": "logo", "RIGHTMETA": "logo"}
 
 
+# 一份标准键盘的按键集合。
+# ⚠️ 实测（Arch + niri + libinput）：uinput 设备光声明几个键（哪怕 ESC/ENTER/字母）
+#    都拿不到 udev 的 ID_INPUT_KEYBOARD=1 标签，libinput 就不把它当键盘、
+#    注入的按键会被静静丢掉；声明整套标准键位才会被当成键盘。
+_KEYBOARD_KEYS = ("ESC 1 2 3 4 5 6 7 8 9 0 MINUS EQUAL BACKSPACE TAB "
+                  "Q W E R T Y U I O P LEFTBRACE RIGHTBRACE ENTER LEFTCTRL "
+                  "A S D F G H J K L SEMICOLON APOSTROPHE GRAVE LEFTSHIFT "
+                  "BACKSLASH Z X C V B N M COMMA DOT SLASH RIGHTSHIFT KPENTER "
+                  "LEFTALT RIGHTALT SPACE CAPSLOCK F1 F2 F3 F4 F5 F6 F7 F8 F9 "
+                  "F10 F11 F12 LEFTMETA RIGHTMETA").split()
+
+
 class Injector:
     """把按键组合送进当前焦点窗口（剪贴板已经在前面写好了）"""
 
@@ -513,14 +526,27 @@ class UinputInjector(Injector):
         from evdev import ecodes as e, UInput
         self.cfg = cfg
         self.e = e
-        keys = {e.KEY_ENTER, e.KEY_VOLUMEUP, e.KEY_VOLUMEDOWN}
+        keys = set()
+        for name in _KEYBOARD_KEYS:                 # 先声明整套标准键位（见常量注释）
+            code = getattr(e, "KEY_" + name, None)
+            if code is not None:
+                keys.add(code)
         for group in ("paste_mods", "paste_mods_terminal"):
             for m in (cfg.get(group) or []):
                 keys.add(getattr(e, "KEY_" + m))
         keys.add(getattr(e, "KEY_" + cfg["paste_key"]))
+        keys.add(e.KEY_ENTER)
+        keys.add(e.KEY_VOLUMEUP)
+        keys.add(e.KEY_VOLUMEDOWN)
         self.ui = UInput({e.EV_KEY: sorted(keys)},
                          name="voicetype-vkbd", bustype=e.BUS_USB)
         time.sleep(0.35)          # 等合成器识别到新设备
+
+    def device_path(self):
+        try:
+            return self.ui.device.path if self.ui.device else "?"
+        except Exception:
+            return "?"
 
     def paste(self, mods):
         e, ui = self.e, self.ui
@@ -1243,11 +1269,19 @@ def cmd_check(cfg):
 
     if need_evdev:
         print("── 设备 ──")
+        desktop = (cfg.get("mode") or "phone").lower() == "desktop"
         d = find_device(cfg["trigger_device"])
-        print("  触发设备     : %s" % (("%s (%s) ✅" % (d.name, d.path)) if d else "❌ " + cfg["trigger_device"]))
-        if not d:
+        if d:
+            print("  触发设备     : %s (%s) ✅" % (d.name, d.path))
+        elif desktop:
+            print("  触发设备     : ⚠️ 没找到 %s（桌面模式不需要，手机模式才用）" % cfg["trigger_device"])
+        else:
+            print("  触发设备     : ❌ %s" % cfg["trigger_device"])
             ok = False
-        print("  /dev/uinput  : %s" % ("✅ 可写" if os.access("/dev/uinput", os.W_OK) else "❌ 不可写"))
+        up = os.access("/dev/uinput", os.W_OK)
+        print("  /dev/uinput  : %s" % ("✅ 可写" if up else "❌ 不可写（跑一次 setup-uinput-desktop.sh）"))
+        if not up:
+            ok = False
 
     print("── 会话 ──")
     env = session_env()
